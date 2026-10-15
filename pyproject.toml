@@ -40,3 +40,8 @@ addopts = "-ra -q --tb=short"
 testpaths = ["tests"]
 pythonpath = ["."]
 asyncio_mode = "auto"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["pipeline*", "shared*", "biosignal_mock*"]
+exclude = ["scratch*", "tests*", "tools*", "docs*"]

@@ -785,7 +785,8 @@ class StorageEngine:
                             break
 
                     # 2. Authoritative contiguous resolved index (samples + authoritative loss)
-                    resolved = -1
+                    # By monotonic invariant, resolved >= persisted; samples 0..persisted are guaranteed present.
+                    resolved = persisted
                     while True:
                         cand = resolved + 1
                         cursor.execute(

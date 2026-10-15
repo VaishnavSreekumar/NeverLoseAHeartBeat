@@ -1037,12 +1037,17 @@ async def test_ground_truth_reconciliation_automated_oracle(tmp_path: Path) -> N
             if sess_id:
                 c1 = storage.get_checkpoint(sess_id, 1)
                 c2 = storage.get_checkpoint(sess_id, 2)
-                if c1.contiguous_persisted_index >= 400 and c2.contiguous_persisted_index >= 400:
+                if c1.contiguous_persisted_index >= 999 and c2.contiguous_persisted_index >= 999:
                     break
             await asyncio.sleep(0.05)
 
         sess_id = client.current_session_id
-        assert sess_id is not None
+        assert sess_id is not None, "Client did not establish a session before timeout"
+        c1 = storage.get_checkpoint(sess_id, 1)
+        c2 = storage.get_checkpoint(sess_id, 2)
+        assert (
+            c1.contiguous_persisted_index >= 999 and c2.contiguous_persisted_index >= 999
+        ), f"Ingestion timed out before reaching index 999 (S1={c1.contiguous_persisted_index}, S2={c2.contiguous_persisted_index})"
 
         export_file = tmp_path / "oracle_export.ndjson"
         export_device_data(storage, sess_id, export_file)
