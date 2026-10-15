@@ -50,12 +50,13 @@ In a reliability-critical medical pipeline, automated testing is the only defens
 | **TST-01** | `test_protocol_framing_and_crc` | REQ-A-07, REQ-A-09, REQ-A-10 | Unit test with valid and corrupted NDJSON frames | CRC matches `zlib.crc32(raw_bytes)`; malformed frames rejected. |
 | **TST-02** | `test_ramp_mode_deterministic` | REQ-A-05, REQ-A-06 | Generate $10^5$ samples with seed 7; assert formulas | Bit-for-bit match with $(3i+c) \bmod 8388608$ and $(2i+c) \bmod 8388608$. |
 | **TST-03** | `test_signal_mode_synthetics` | REQ-A-03, REQ-A-04 | 10-minute signal generation run; detect peaks | Channel 2 HR matches 60, 90, 72 bpm cycle; Ch1=0.6*Ch2; Ch3=1.3*Ch2. |
-| **TST-04** | `test_interleaved_sensor_polling_under_faults` | REQ-A-01, REQ-B-01, REQ-B-02 | Inject 5s sensor stall, 10% corrupt CRC, and duplicate frames on single TCP socket | Client alternates queries without deadlock; neither sensor's buffer exceeds 70% capacity (7s lag); zero unforced overflow. |
-| **TST-05** | `test_buffer_overflow_loss_logging` | REQ-A-11, REQ-B-08, REQ-H-05 | Pause client read for 12 seconds; resume read | Mock returns `lost` range; loss recorded in `loss_ledger`; zero silent loss. |
-| **TST-06** | `test_crc_corruption_and_reread` | REQ-B-04, REQ-A-12 | Inject 10% corrupted CRC responses in mock | Pipeline rejects corrupt frames, requests `from_index`, recovers valid data. |
-| **TST-07** | `test_duplicate_response_rejection` | REQ-B-05, REQ-E-03 | Inject duplicate replies from mock | Local SQLite maintains unique sample count; zero primary key collisions. |
-| **TST-08** | `test_session_restart_unknown_end` | REQ-E-04, REQ-A-12 | Mock restarts during run; new session ID generated | Loss recorded with `to_index: null` and reason `session_restart`. |
-| **TST-09** | `test_sqlite_batch_durability_and_power_loss` | REQ-B-03, REQ-B-06, REQ-B-07 | Abrupt unbuffered crash / power cut during active ingestion | `PRAGMA integrity_check` clean; loss gap $(i_{\text{cut}} - i_{\text{committed}})/400 \le \text{Target Bound}$ (0.5s); gap logged in `loss_ledger`. |
+| **TST-04** | `test_interleaved_sensor_polling_under_faults` | REQ-A-01, REQ-B-01, REQ-B-02 | Inject 5s sensor stall, 10% corrupt CRC, duplicate frames, and queue saturation on single TCP socket | Client alternates queries without deadlock; bounded queue enforces backpressure without RAM growth; neither sensor's buffer exceeds capacity; zero unforced overflow. |
+| **TST-05** | `test_buffer_overflow_loss_logging` | REQ-A-11, REQ-B-08, REQ-H-05 | Pause client read for 12 seconds; resume read | Mock returns `lost` range; loss recorded in `loss_ledger`; $I_{\text{resolved}}$ bridges confirmed gap and advances past lost indices; zero silent loss. Strict loss-merging rules verified (never merge across distinct reasons, never merge with persisted samples). |
+| **TST-06** | `test_crc_corruption_and_reread` | REQ-B-04, REQ-A-12 | Inject corrupted CRC responses; test 1–3 retries and exceeding retry bound | Pipeline rejects corrupt frames, requests `from_index` targeting $I_{\text{resolved}} + 1$; on exceeding 3 retries, logs quarantined entry in `unresolved_crc_incidents` without advancing $I_{\text{resolved}}$ or writing to `loss_ledger`; verifies transition to confirmed loss occurs ONLY upon mock buffer eviction or session restart; zero corrupt values enter SQLite. |
+| **TST-06B** | `test_crc_failure_forward_progress_and_in_process_recovery` | REQ-B-04, REQ-B-06 | Inject CRC corruption on batch [1000, 1099]; fail 3 retries; ingest subsequent batch [1100, 1199]; re-poll [1000, 1099] via in-process sweeper and recover | Intermediate state: $I_{\text{obs}}=1199$, $I_{\text{persisted}}=999$, $I_{\text{resolved}}=999$, 0 rows in `loss_ledger`. After recovery: $I_{\text{persisted}}=1199$, $I_{\text{resolved}}=1199$, $I_{\text{obs}}=1199$; zero false loss recorded; contiguous cursors advance seamlessly; window analytics unbroken [0, 1199]. |
+| **TST-07** | `test_duplicate_response_rejection_and_integrity` | REQ-B-05, REQ-E-03 | Inject identical duplicate replies, conflicting duplicates (same index, different values), and overlapping loss-sample records | Identical duplicates safely ignored with incremented telemetry; conflicting sample duplicates raise detectable `IntegrityConflictError`; loss range overlapping persisted sample raises `ContradictoryLossConflictError`. |
+| **TST-08** | `test_session_restart_unknown_end` | REQ-E-04, REQ-A-12 | Mock restarts during run; new session ID generated | Prior session checkpoints and samples preserved untouched; session change establishes transition, not measured loss; open-ended loss recorded with `to_index: null` and reason `session_restart`, preserving terminal uncertainty; new session starts cleanly at index 0. |
+| **TST-09** | `test_sqlite_batch_durability_and_power_loss` | REQ-B-03, REQ-B-06, REQ-B-07 | Abrupt unbuffered crash (`SIGKILL`) / power cut simulation during active batch commit | `WAL` + `synchronous=NORMAL` guarantees 100% process-crash survival and clean WAL rollback; power-loss bound tested as unverified design target (not promised guarantee); empirical loss gap $(i_{\text{cut}} - i_{\text{committed}})/400$ measured; gap logged in `loss_ledger`. |
 | **TST-10** | `test_section3_window_metrics` | REQ-F-01..05, REQ-F-14 | Synthetic 1s windows with known statistics | Exact match for mean, min, max, magnitude, missing counts; 1-decimal round. |
 | **TST-11** | `test_heart_rate_4_rules` | REQ-F-06..13 | Edge cases: $w<4$, missing samples, refractory spacing | Null on missing sample in 5s; exact bpm match on synthetic peaks. |
 | **TST-12** | `test_online_offline_code_parity` | REQ-C-05, REQ-D-02, REQ-D-03 | Execute same dataset through online and offline paths | Outputs are mathematically identical with respective `mode` tags. |
@@ -136,3 +137,28 @@ To guarantee zero silent data loss before submission, we design an independent g
   - Disk bytes written via `/proc/<pid>/io`.
   - Network bytes transmitted via `/proc/net/dev`.
 - **Acceptance:** Average CPU $< 20\%$, Peak RSS $< 150\text{ MB}$, disk/network figures documented for submission.
+
+### 5.4 In-Process CRC Failure, Forward Arrival & Gap Recovery Verification Procedure
+- **Objective:** Verify that when CRC retries fail on an interval, the pipeline advances on the wire to maintain forward ingestion without stalling, quarantines the gap without recording false loss, holds contiguous cursors at the gap boundary, and successfully sweeps and recovers the gap during the same process lifetime.
+- **Procedure:**
+  1. Initialize `biosignal_mock` in deterministic ramp mode with seed 7.
+  2. Start `pipeline` ingesting both sensors at 400 Hz. Ingest clean samples up to index 999 ($I_{\text{persisted}} = 999, I_{\text{resolved}} = 999, I_{\text{obs}} = 999$).
+  3. Configure mock transport fault injection to return corrupted CRC-32 on Sensor 1 batch $[1000, 1099]$.
+  4. Pipeline detects CRC error, issues up to 3 immediate re-reads (`from_index: 1000`), all returning corrupted CRC.
+  5. Transport worker logs $[1000, 1099]$ to in-memory `unresolved_crc_incidents` and advances wire polling cursor $C_{\text{poll}} = 1100$.
+  6. Disable fault injection. Mock delivers clean batch $[1100, 1199]$.
+  7. Pipeline commits $[1100, 1199]$ to `samples`.
+  8. **Assert Intermediate State (Gap Present):**
+     - Query SQLite: `SELECT MAX(sample_index) FROM samples WHERE sensor = 1;` $\rightarrow 1199$ ($I_{\text{obs}} = 1199$).
+     - Query SQLite checkpoints: `contiguous_persisted_index` $\rightarrow 999$, `contiguous_resolved_index` $\rightarrow 999$.
+     - Query SQLite: `SELECT COUNT(*) FROM loss_ledger WHERE sensor = 1 AND from_index >= 1000;` $\rightarrow \mathbf{0}$.
+     - **Verification Invariant:** Zero false loss is recorded; contiguous cursors did NOT advance across the hole.
+  9. Trigger in-process reconciliation sweeper (quiescent poll or 1.0s interval). Client issues targeted re-read: `{"cmd": "read", "sensor": 1, "from_index": 1000}`.
+  10. Mock returns clean batch $[1000, 1099]$ with valid CRC-32.
+  11. Storage commits $[1000, 1099]$ to `samples` in a single atomic transaction.
+  12. **Assert Final State (Gap Recovered):**
+      - `unresolved_crc_incidents` is empty.
+      - Query SQLite checkpoints: `contiguous_persisted_index` $\rightarrow \mathbf{1199}$, `contiguous_resolved_index` $\rightarrow \mathbf{1199}$, `highest_observed_index` $\rightarrow \mathbf{1199}$.
+      - Query SQLite: `SELECT COUNT(*) FROM loss_ledger WHERE sensor = 1 AND from_index >= 1000;` $\rightarrow \mathbf{0}$.
+      - Run `pipeline export`: NDJSON contains contiguous samples $0 \dots 1199$ with zero missing entries and zero duplicate records.
+      - Check Section 3 window analytics: Windows $w=0, 1, 2$ ($[0, 399], [400, 799], [800, 1199]$) all compute with `missing = 0`.

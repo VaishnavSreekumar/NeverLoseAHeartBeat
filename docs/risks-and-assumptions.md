@@ -38,12 +38,17 @@ In safety-critical medical and embedded systems, claiming "zero data loss under 
 ### Risk 01: Durability During Sudden Power Loss
 * **Failure Scenario:** Power cord is pulled from the Raspberry Pi or host system while writes to the database are actively occurring.
 * **Likely Consequence:** Corrupted database header, torn WAL frames, or uncommitted in-memory buffer loss leading to silent sample omission and severe scoring deductions.
-* **Mitigation:** 
-  - Employ SQLite with Write-Ahead Logging (`PRAGMA journal_mode = WAL;`).
-  - Use `PRAGMA synchronous = FULL;` (or `PRAGMA synchronous = NORMAL;` combined with bounded micro-batch transactions).
+* **Durability Trade-off & Guarantee Analysis:**
+  - **`WAL` + `synchronous = NORMAL` (Operational Baseline):**
+    - *What it guarantees:* 100% durability against user-space process crashes (`SIGKILL`, segfaults, unhandled exceptions) with zero database page corruption and automatic WAL recovery to the last committed atomic transaction.
+    - *What it does NOT guarantee:* Does not guarantee that uncheckpointed WAL frames in the OS page cache will survive an abrupt physical power cut. `NORMAL` syncs the WAL file only during checkpoints.
+  - **`WAL` + `synchronous = FULL` (High-Durability Sync Mode):**
+    - *What it guarantees:* Issues an `fsync()` on the WAL file on every batch commit, forcing dirty pages to the disk controller write cache before `COMMIT` returns.
+    - *What it does NOT guarantee on commodity hardware:* Commodity SD cards, eMMC, and USB flash memory lack hardware Power-Loss Protection (PLP) supercapacitors. Internal flash controller volatile caches can lose data during abrupt $V_{cc}$ collapse, and flash block erases in-flight can cause sector tearing. Furthermore, per-commit `fsync` incurs 20–50 ms latency on flash media, causing severe write amplification.
+* **Durability Stance: Target vs. Promise:**
   - Group incoming sensor samples into atomic micro-batches committed every **250 ms** (100 samples per sensor).
-  - Wrap batch writes in an explicit transaction (`BEGIN IMMEDIATE ... COMMIT`) followed by a controlled sync.
-  - On restart, SQLite automatically runs WAL recovery to restore the database to the last committed atomic transaction.
+  - Wrap batch writes in an explicit transaction (`BEGIN IMMEDIATE ... COMMIT`).
+  - **No 0.5-second guarantee is promised without empirical evidence:** The 0.50-second power-loss bound is strictly an **UNVERIFIED DESIGN TARGET**. No claim of verified 0.5-second power-loss durability is made until empirical testing with sudden unbuffered power cuts is measured on physical target hardware.
 * **Exact Empirical Test Required to Establish Defensible Bound:**
   1. Start continuous dual-sensor ingestion at 800 Hz against mock generating deterministic ramp data.
   2. Record parallel ground-truth timestamp and generation index at source.
@@ -60,50 +65,74 @@ In safety-critical medical and embedded systems, claiming "zero data loss under 
 * **Failure Scenario:** The mock service only retains the last 10 seconds of data per sensor (4000 samples). If the local ingestion loop is blocked by slow disk I/O, CPU spikes, or garbage collection, the mock drops older samples and appends them to the `lost` list.
 * **Likely Consequence:** Permanent data loss. If the pipeline ignores or fails to parse the `lost` array in the mock response, the loss is silent, incurring a 5-point deduction per occurrence (up to 30 points).
 * **Mitigation:**
-  - Decouple TCP network acquisition from disk persistence via an asynchronous, lock-free queue (`asyncio.Queue` with bounded capacity).
-  - The TCP ingestion loop runs with high priority, performing zero expensive operations beyond frame framing and CRC validation.
-  - Parse the `lost` array on every reply and immediately insert loss ranges into the `loss_ledger` table with reason `mock_buffer_overflow`.
+  - Decouple TCP network acquisition from disk persistence via an asynchronous, lock-free queue (`asyncio.Queue(maxsize=50)` batches).
+  - The TCP ingestion loop runs with high priority, performing zero expensive operations beyond framing and CRC validation.
+  - Parse the `lost` array on every reply and immediately insert confirmed loss ranges into the `loss_ledger` table with distinct reasons (`buffer_overflow`, `sensor_stall`).
+  - **Strict Loss-Range Merging Rules:**
+    1. *Never merge across conflicting causes:* Distinct root causes (`buffer_overflow` vs `sensor_stall`) must never be combined into a single record.
+    2. *Never merge unresolved incidents with confirmed losses:* Quarantined CRC incidents are not merged with authoritative source drops.
+    3. *Never merge if overlapping with persisted samples:* A loss range covering indices present in `samples` constitutes a **CONTRADICTORY LOSS CONFLICT** and must raise an integrity exception (`ContradictoryLossConflictError`).
+    4. *Valid Merge Criteria:* Spans $[\min(f_1, f_2), \max(t_1, t_2)]$ are merged only if session, sensor, and reason are identical, spans are strictly adjacent or overlapping, and zero samples exist in `samples` for the range.
 * **Test Required:** Inject a synthetic 12-second processing stall into the pipeline read loop. Verify that upon resuming, the pipeline records the exact dropped range reported by the mock in its `loss_ledger` and reflects it in `pipeline export`.
 
 ---
 
-### Risk 03: Corrupt CRC Responses
+### Risk 03: Corrupt CRC Responses & Transport Incidents vs. Confirmed Loss
 * **Failure Scenario:** The mock intentionally injects communication faults by altering payload characters or sending a mismatching `crc32` string.
 * **Likely Consequence:** Pipeline ingests corrupted values into the database, skewing heart-rate and window statistical calculations (violating Criterion 7), or fails to re-read and loses data silently.
 * **Mitigation:**
-  - Extract the raw string of the `data` array exactly as received between the outer `[` and `]`.
+  - Extract the raw string of the `data` array exactly as received between the outer `[` and `]` in memory before interacting with the storage queue or database.
   - Compute standard zlib CRC-32 on the UTF-8 bytes: `f"{zlib.crc32(raw_data_bytes) & 0xffffffff:08x}"`.
-  - If mismatch occurs, discard the payload immediately and send a re-read command: `{"cmd": "read", "sensor": S, "from_index": expected_index}`.
-  - Bound re-reads to 3 attempts before logging a communication failure.
-* **Test Required:** Configure mock fault injection to corrupt 5% of responses. Verify that all corrupted payloads are rejected, re-read commands are dispatched, and zero corrupt values enter SQLite.
+  - If mismatch occurs, discard the payload immediately; corrupted samples never enter the pipeline queue or SQLite.
+  - Send targeted re-read command requesting `from_index = I_resolved + 1`.
+  - Bound re-reads to 3 attempts.
+  - **Three failed CRC retries alone must NOT establish that samples are permanently lost:**
+    - Checksum mismatches indicate transport corruption or framing errors on the wire; the mock service may still retain the intact samples in its 10-second ring buffer.
+    - If 3 consecutive re-reads fail, the client avoids deadlocking the dual-sensor polling loop by logging the failed interval into an in-memory **`unresolved_crc_incidents`** ledger and advancing its wire polling command to `from_index = failed_to_index + 1`.
+    - Crucially, `highest_contiguous_persisted_index` ($I_{\text{persisted}}$) and `highest_contiguous_resolved_index` ($I_{\text{resolved}}$) **DO NOT advance** across the unresolved gap. They remain frozen at the last contiguous resolved index prior to the incident.
+    - No record is inserted into `loss_ledger`, and the unreceived samples are NOT presented to the ground-truth auditor as confirmed loss.
+  - **Evidence Required to Transition an Incident to Confirmed Loss:**
+    1. *Authoritative Source Eviction:* The mock service advances past its 10-second ring buffer capacity and returns an explicit loss range in the `lost` array with reason `buffer_overflow` covering the gap. Only when this authoritative source drop is received is the loss written to `loss_ledger`, allowing $I_{\text{resolved}}$ to advance.
+    2. *Server Restart / Session Transition:* The server resets or crashes, returning a new `session_id`. The old session terminates with an unclosed interval $[I_{\text{resolved}} + 1, \text{null}]$ with `reason: "session_restart"` (preserving terminal uncertainty).
+    - If neither occurs before a pipeline restart, restart recovery re-polls from $I_{\text{resolved}} + 1$, allowing the pipeline to re-acquire the samples if still in the buffer.
+* **Test Required:** Configure mock fault injection to corrupt 5% of responses. Verify that all corrupted payloads are rejected, re-read commands are dispatched, and zero corrupt values enter SQLite. Verify that 3 failed retries log an unresolved incident without advancing $I_{\text{resolved}}$ or declaring permanent loss, and that transition to confirmed loss requires explicit mock buffer eviction or session transition.
 
 ---
 
-### Risk 04: Duplicate Mock Replies
-* **Failure Scenario:** The mock service retransmits the same reply frame twice due to internal fault injection or TCP window retransmissions.
-* **Likely Consequence:** Local database contains duplicated sample indices, distorting 1-second window counts and triggering Criterion 1 failure ("Every sample received is on its disk, exactly once").
+### Risk 04: Duplicate Mock Replies & Conflicting Integrity
+* **Failure Scenario:** The mock service retransmits the same reply frame twice due to internal fault injection or TCP window retransmissions. Alternatively, a malformed transmission sends conflicting values for an already committed index.
+* **Likely Consequence:** Local database contains duplicated sample indices, distorting 1-second window counts and triggering Criterion 1 failure, or silently overwrites valid data with corrupted values.
 * **Mitigation:**
   - Database schema enforces a composite unique constraint: `PRIMARY KEY (session_id, sensor, sample_index)`.
-  - Batch insert statements utilize `INSERT OR IGNORE INTO samples ...`.
-  - Track `expected_next_index` per sensor in memory; if `reply.first_index < expected_next_index`, skip already-stored records before insertion.
-* **Test Required:** Feed duplicate NDJSON frames to the pipeline ingestion socket. Query the database to verify `COUNT(*)` matches the unique index range with zero duplicate keys.
+  - Blind `INSERT OR IGNORE` is strictly replaced with explicit idempotency validation:
+    - If incoming sample index is already committed and values are **identical**: safely ignore duplicate and increment `duplicate_samples_ignored` telemetry counter.
+    - If incoming sample index is already committed and values are **different**: raise an immediate `IntegrityConflictError`, log a security/defect alert, and do NOT overwrite existing committed data.
+* **Test Required:**
+  1. Feed duplicate identical NDJSON frames to the pipeline ingestion socket. Verify `COUNT(*)` matches unique index count and duplicates are safely ignored.
+  2. Feed an altered sample with an identical index but different values. Verify an integrity conflict is raised and committed data is not altered.
 
 ---
 
-### Risk 05: Mock Session Restarts & Unknown Loss-Range Ends
+### Risk 05: Mock Session Transitions & Terminal Uncertainty
 * **Failure Scenario:** The mock service crashes or restarts mid-run. This resets the index counter to 0 and generates a new `session_id`. The client was reading previous session data and has an unread gap.
-* **Likely Consequence:** Unread samples of the old session are lost forever. If the pipeline does not record this loss, it is classified as silent loss.
+* **Likely Consequence:** Unread samples of the old session are lost forever. If the pipeline does not record this loss, it is classified as silent loss. If it combines sessions, indexes collide.
 * **Mitigation:**
   - On every response, inspect `session_id`. If `session_id != current_session_id`:
-    1. Mark the previous session as terminated.
-    2. If the previous session ended without `session_end: true`, record a loss entry in `loss_ledger`:  
-       `{"sensor": S, "from_index": last_seen_index + 1, "to_index": None, "reason": "session_restart"}`.
-    3. Initialize state for the new session starting at `first_index`.
+    1. A new session ID establishes that a **session transition** occurred (e.g. server restart, process crash).
+    2. **It does NOT establish the exact extent of missing samples in the old session.**
+    3. Preserve all prior session data, checkpoints, and loss records permanently. Never mix samples from different sessions.
+    4. Check if the prior session concluded with `session_end: true`. If so, clean closure, no open gap.
+    5. If prior session ended without `session_end: true`:
+       - Query SQLite for the last committed index of the prior session: $i_{\text{last}} = \text{checkpoints.last\_saved\_index}$.
+       - Record an open-ended loss record in `loss_ledger`:  
+         `{"session_id": old_session, "sensor": S, "from_index": i_last + 1, "to_index": null, "reason": "session_restart"}`.
+       - **Preserving Uncertainty:** `to_index: null` represents an unclosed terminal interval of indeterminate extent. The pipeline does not invent an arbitrary end index or present unmeasured samples as quantified loss.
+    6. Initialize new checkpoint for `(new_session_id, sensor)` starting at index 0 and resume collection from index 0.
 * **Test Required:** Restart the mock service process during an active recording session. Verify that `pipeline export` outputs the `to_index: null` loss record for the aborted session and correctly begins tracking the new session from index 0.
 
 ---
 
-### Risk 06: Simultaneous Collection from Two Sensors over Single TCP Socket
+### Risk 06: Simultaneous Collection, Queue Sizing & Backpressure
 * **Protocol & Transport Constraints:**
   - Both sensors generate data continuously at 400 Hz (total 800 samples/sec, 1 sample every 2.5 ms per sensor).
   - The mock service operates strictly as a single-client TCP server with a request-response protocol (`{"cmd": "read", "sensor": S}`).
@@ -112,15 +141,17 @@ In safety-critical medical and embedded systems, claiming "zero data loss under 
 * **Failure Scenarios & Bottleneck Analysis:**
   1. *Starvation via Sequential Polling:* If the client polls Sensor 1 continuously or waits too long between polls, Sensor 2 accumulates unread samples at 400 samples/sec and overflows its 10-second ring buffer within 10.0 seconds.
   2. *Sensor Stall Deadlock:* The mock intentionally stalls or stops sending one sensor. If the client executes a blocking `socket.recv()` waiting for that sensor's reply, the entire polling loop blocks, starving the other sensor and causing ring buffer overflow on both.
-  3. *Corrupt CRC Re-read Delays:* If replies are corrupted, client must issue re-read commands (`from_index`). Multiple sequential re-reads could consume polling cycle time.
-  4. *Duplicate Reply Ingestion Latency:* Processing redundant replies must not introduce I/O stalls that back up the TCP stream.
+  3. *Unbounded Memory Growth under Disk Latency:* If disk writes freeze or slow down while network ingestion continues, unbounded in-memory queues cause process OOM.
 * **Mitigation & Mathematical Feasibility Validation:**
-  - **Strict Round-Robin Scheduler:** The ingestion loop strictly alternates polling: `read(sensor=1) -> process -> read(sensor=2) -> process`.
-  - **Non-Blocking / Timed Socket I/O:** The TCP socket uses a strict **1.0-second read timeout** (`sock.settimeout(1.0)`). If a sensor read times out (e.g. mock stall), the client immediately logs a communication event and switches to poll the other sensor, preventing mutual starvation.
-  - **Nominal Cadence & Margin:** In normal operation at 4 Hz polling (every 250 ms), each read retrieves ~100 samples. Over local TCP loopback, round-trip request-reply latency is $< 1.0\text{ ms}$. Total round-trip time for both sensors is $< 2.5\text{ ms}$ per 250ms window, yielding an operational safety margin of **$> 99\%$ idle/buffer margin**.
-  - **Burst Backlog Catch-Up:** When catching up after a stall, each reply returns up to 400 samples (1.0 second of data) in a single $\approx 1\text{ ms}$ round trip. The client can drain 4,000 samples (10 seconds of data) in 10 sequential round trips ($\approx 15\text{ ms}$), catching up at **$> 200\times$ real-time speed**, easily preventing buffer overflow as long as the mock resumes before 10 seconds elapse.
-  - **Duplicate & Corrupt Re-read Bounding:** CRC verification is in-memory pure integer zlib ($< 0.1\text{ ms}$). Re-reads are bounded to 3 attempts before declaring an unrecoverable gap in `loss_ledger`. Duplicate frames are detected via `first_index < expected_index` in memory and dropped without disk overhead.
-* **Test Required:** Run stress-test harness injecting 5-second selective sensor stalls, 10% corrupted CRCs, and duplicated replies under full 800 Hz generation. Verify that neither sensor's buffer exceeds 70% capacity (7.0 seconds lag) and zero unforced buffer overflow occurs.
+  - **Strict Round-Robin Scheduler:** The ingestion loop strictly alternates polling: `read(sensor=1) -> read(sensor=2)`.
+  - **Non-Blocking / Timed Socket I/O:** The TCP socket uses a strict **1.0-second read timeout** (`sock.settimeout(1.0)`). If a sensor read times out, the client logs a stall and immediately switches to poll the other sensor.
+  - **Bounded Response-Batch Queue:**
+    - Queue holds **response batches** (`IngestBatch`), not individual samples.
+    - Capacity is strictly capped at **50 response batches** (max 20,000 samples = 25 seconds dual sensor, $< 1.5\text{ MB}$ RAM).
+    - When the queue fills, `await queue.put()` blocks, naturally pausing network polling and propagating backpressure to the mock server's 10-second ring buffer.
+    - If disk I/O stalls $> 10$ seconds, the mock drops older samples and returns `buffer_overflow` in `lost`, which the pipeline commits once disk I/O resumes. RAM never exceeds $< 5\text{ MB}$.
+  - **Burst Backlog Catch-Up:** In burst recovery, each reply returns up to 400 samples (1.0 second of data) in a single $\approx 1\text{ ms}$ round trip, draining backlogs at $> 200\times$ real-time speed.
+* **Test Required:** Run stress-test harness injecting 5-second selective sensor stalls, 10% corrupted CRCs, duplicated replies, and synthetic queue backpressure under full 800 Hz generation. Verify queue never exceeds 50 batches and zero unhandled overflow occurs.
 
 ---
 
@@ -205,7 +236,7 @@ In safety-critical medical and embedded systems, claiming "zero data loss under 
 * **Likely Consequence:** Pipeline cannot be deployed on Raspberry Pi 4 or gets killed by Linux OOM killer (`Out of Memory: Kill process`).
 * **Mitigation:**
   - Restrict technology stack to pure-Python 3 and Python standard library where possible (e.g., standard `sqlite3`, `asyncio`, `socket`, `zlib`).
-  - Cap all internal queues (`asyncio.Queue(maxsize=1000)`).
+  - Cap all internal queues (ingestion queue capped at 50 response batches: max 20,000 samples, $< 2.0\text{ MB}$ RAM).
   - Explicitly benchmark memory footprint to guarantee steady-state RSS remains $< 150\text{ MB}$, well below the 2 GB limit.
 * **Test Required:** Run pipeline inside a Linux cgroup restricted to 4 CPU cores (`cpu.max = "400000 100000"`) and 2 GB RAM (`memory.max = "2G"`). Verify stable execution and record CPU and memory utilization.
 
@@ -239,12 +270,12 @@ In safety-critical medical and embedded systems, claiming "zero data loss under 
 
 | Risk ID | Description | Severity | Probability | Primary Mitigation |
 | :--- | :--- | :---: | :---: | :--- |
-| **RSK-01** | Power loss database corruption | Critical | High | SQLite WAL mode, 250ms batch transactions, explicit fsync |
-| **RSK-02** | Mock 10s buffer overflow | High | Medium | Decoupled async reader, high-priority TCP loop, loss ledger |
-| **RSK-03** | Corrupt CRC-32 response | High | High | Strict zlib CRC validation, re-read via `from_index` |
-| **RSK-04** | Duplicate mock replies | Medium | High | `PRIMARY KEY (session_id, sensor, index)`, `INSERT OR IGNORE` |
-| **RSK-05** | Mock restart / unknown end | High | Medium | Track `session_id`, log `to_index: null` in loss ledger |
-| **RSK-06** | Single socket dual-sensor starvation | High | Medium | Interleaved round-robin polling over single connection |
+| **RSK-01** | Power loss database corruption | Critical | High | SQLite WAL mode (`NORMAL`/`FULL` trade-off), 250ms batching; 0.5s is unverified target |
+| **RSK-02** | Mock 10s buffer overflow | High | Medium | Decoupled async reader, bounded queue (50 batches), strict loss merging rules |
+| **RSK-03** | Corrupt CRC-32 response | High | High | Strict CRC check, bounded retry; quarantined incident ledger; transition requires buffer drop |
+| **RSK-04** | Duplicate mock replies | Medium | High | `PRIMARY KEY (session_id, sensor, index)`, explicit duplicate validation (conflicts raise error) |
+| **RSK-05** | Mock restart / unknown end | High | Medium | Track `session_id`; session change establishes transition, not measured loss; log `to_index: null` |
+| **RSK-06** | Single socket dual-sensor starvation | High | Medium | Interleaved round-robin polling, 1s socket timeouts, bounded 50-batch response queue |
 | **RSK-07** | Network drop during cloud write | Critical | High | Local-first architecture: cloud sync reads from local SQLite |
 | **RSK-08** | Cloud duplicate ingestion | High | High | Idempotent UPSERT, checkpoint tracking |
 | **RSK-09** | Window boundary sample drift | Critical | Medium | Index-based window partitioning ($400w \le i \le 400w + 399$) |
