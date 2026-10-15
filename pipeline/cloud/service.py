@@ -90,22 +90,23 @@ class CloudProcessingService:
         s1_samples, s2_samples = self.storage.get_samples_for_session(session_id)
         loss_ranges = self.storage.get_loss_records_for_session(session_id)
 
-        # Process sequentially with SignalProcessingEngine(mode="online")
+        # Process needed windows with 5-second lookback priming
+        eval_start_w = max(0, min(needed) - 4)
+        windows_to_process = list(range(eval_start_w, max_ready_w + 1))
+
         engine = SignalProcessingEngine(session_id=session_id, mode="online")
-        all_windows = list(range(max_ready_w + 1))
-        results = engine.process_windows(
-            windows=all_windows,
+        new_results = engine.process_windows(
+            windows=windows_to_process,
             sensor1_samples=s1_samples,
             sensor2_samples=s2_samples,
             loss_ranges=loss_ranges,
             session_id=session_id,
         )
 
-        # Persist all computed window results (upsert guarantees refined results are updated)
-        for res in results:
-            self.storage.save_window_result(res)
+        # Persist evaluated window results in a single atomic transaction
+        self.storage.save_window_results(new_results)
 
-        return results
+        return self.storage.get_window_results(session_id)
 
     def get_results(self, session_id: str) -> list[WindowResult]:
         """Fetch all verified window results for a session, computing any pending ready windows."""

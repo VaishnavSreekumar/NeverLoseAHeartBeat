@@ -912,12 +912,18 @@ class CloudStorageEngine:
 
     def save_window_result(self, result: WindowResult) -> None:
         """Persist a computed Section 3 window result."""
+        self.save_window_results([result])
+
+    def save_window_results(self, results: list[WindowResult]) -> None:
+        """Persist a list of computed Section 3 window results in a single atomic transaction."""
+        if not results:
+            return
         with self._lock:
             cursor = self._conn.cursor()
             now = time.time()
             try:
                 cursor.execute("BEGIN IMMEDIATE;")
-                cursor.execute(
+                cursor.executemany(
                     """
                     INSERT INTO window_results (
                         session_id, window, mode, complete, missing_1, missing_2,
@@ -934,18 +940,21 @@ class CloudStorageEngine:
                         result_json = excluded.result_json,
                         created_at = excluded.created_at;
                     """,
-                    (
-                        result.session_id or "",
-                        result.window,
-                        result.mode,
-                        1 if result.complete else 0,
-                        result.missing_1,
-                        result.missing_2,
-                        result.magnitude,
-                        result.heart_rate,
-                        json.dumps(result.to_dict()),
-                        now,
-                    ),
+                    [
+                        (
+                            res.session_id or "",
+                            res.window,
+                            res.mode,
+                            1 if res.complete else 0,
+                            res.missing_1,
+                            res.missing_2,
+                            res.magnitude,
+                            res.heart_rate,
+                            json.dumps(res.to_dict()),
+                            now,
+                        )
+                        for res in results
+                    ],
                 )
                 cursor.execute("COMMIT;")
             except Exception:

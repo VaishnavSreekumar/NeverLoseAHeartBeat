@@ -52,8 +52,12 @@ def get_default_db_path() -> Path:
 def cmd_status(args: argparse.Namespace) -> int:
     """Execute `pipeline status` command."""
     db_path = Path(args.db) if args.db else get_default_db_path()
+    cloud_url = getattr(args, "cloud_url", None) or os.environ.get("PIPELINE_CLOUD_URL", "http://localhost:8000")
 
     samples_saved = 0
+    local_replicated_samples: Optional[int] = None
+    local_backlog: Optional[int] = None
+
     if db_path.exists():
         try:
             conn = sqlite3.connect(str(db_path), timeout=5.0)
@@ -65,16 +69,57 @@ def cmd_status(args: argparse.Namespace) -> int:
                 if cursor.fetchone():
                     cursor.execute("SELECT COUNT(*) FROM samples;")
                     samples_saved = cursor.fetchone()[0]
+
+                cursor.execute(
+                    "SELECT name FROM sqlite_master WHERE type='table' AND name='cloud_checkpoints';"
+                )
+                if cursor.fetchone():
+                    cursor.execute("SELECT COUNT(*) FROM cloud_checkpoints;")
+                    if cursor.fetchone()[0] > 0:
+                        cursor.execute("""
+                            SELECT COUNT(*) FROM samples s
+                            JOIN cloud_checkpoints c ON s.session_id = c.session_id AND s.sensor = c.sensor
+                            WHERE s.sample_index <= c.cloud_resolved_index;
+                        """)
+                        local_replicated_samples = cursor.fetchone()[0]
+                        local_backlog = max(0, samples_saved - local_replicated_samples)
             finally:
                 conn.close()
         except sqlite3.Error as exc:
             sys.stderr.write(f"Warning: Error querying database '{db_path}': {exc}\n")
 
+    # Probe cloud receiver
+    cloud_healthy = False
+    cloud_sample_count: Optional[int] = None
+    try:
+        import httpx
+        with httpx.Client(timeout=1.0) as client:
+            resp = client.get(f"{cloud_url.rstrip('/')}/api/v1/status")
+            if resp.status_code == 200:
+                cloud_healthy = True
+                c_data = resp.json()
+                cloud_sample_count = c_data.get("total_samples", 0)
+    except Exception:
+        cloud_healthy = False
+
+    if cloud_healthy and cloud_sample_count is not None:
+        mode = "online"
+        samples_in_cloud = cloud_sample_count
+        backlog = max(0, samples_saved - (local_replicated_samples if local_replicated_samples is not None else samples_in_cloud))
+    elif local_replicated_samples is not None:
+        mode = "offline"
+        samples_in_cloud = local_replicated_samples
+        backlog = local_backlog
+    else:
+        mode = "offline"
+        samples_in_cloud = None
+        backlog = None
+
     status_record = {
-        "mode": "offline",
+        "mode": mode,
         "samples_saved": samples_saved,
-        "samples_in_cloud": None,
-        "backlog": None,
+        "samples_in_cloud": samples_in_cloud,
+        "backlog": backlog,
     }
 
     sys.stdout.write(json.dumps(status_record) + "\n")
@@ -87,18 +132,39 @@ def cmd_export(args: argparse.Namespace) -> int:
     session_id: str = args.session
     source: str = args.from_source.lower()
 
-    if source == "cloud":
-        sys.stderr.write(
-            "Error: Cloud export is unavailable. Cloud synchronization is not yet active "
-            "(Increment B offline mode). Use '--from device' for local data.\n"
-        )
-        return 1
-
-    if source != "device":
+    if source not in ("device", "cloud"):
         sys.stderr.write(
             f"Error: Unsupported export source '{args.from_source}'. Must be 'device' or 'cloud'.\n"
         )
         return 2
+
+    if source == "cloud":
+        cloud_url = getattr(args, "cloud_url", None) or os.environ.get("PIPELINE_CLOUD_URL", "http://localhost:8000")
+        try:
+            import httpx
+            with httpx.Client(timeout=10.0) as client:
+                resp = client.get(f"{cloud_url.rstrip('/')}/api/v1/export", params={"session": session_id})
+                if resp.status_code == 200:
+                    content = resp.text
+                    lines = [ln for ln in content.strip().splitlines() if ln]
+                    for line in lines:
+                        sys.stdout.write(line + "\n")
+                    sys.stdout.flush()
+                    sys.stderr.write(f"Exported {len(lines)} lines for session {session_id} from cloud.\n")
+                    return 0
+                elif resp.status_code == 404:
+                    sys.stderr.write(f"Error: Session '{session_id}' not found in cloud receiver.\n")
+                    return 1
+                else:
+                    sys.stderr.write(
+                        f"Error: Cloud export is unavailable. Receiver returned HTTP {resp.status_code}: {resp.text}\n"
+                    )
+                    return 1
+        except Exception as exc:
+            sys.stderr.write(
+                f"Error: Cloud export is unavailable. Could not connect to cloud receiver at {cloud_url}: {exc}\n"
+            )
+            return 1
 
     db_path = Path(args.db) if args.db else get_default_db_path()
     if not db_path.exists():
@@ -271,6 +337,12 @@ def build_parser() -> argparse.ArgumentParser:
         default=None,
         help="Path to pipeline SQLite database file",
     )
+    p_status.add_argument(
+        "--cloud-url",
+        dest="cloud_url",
+        default=None,
+        help="URL of the cloud receiver service",
+    )
     p_status.set_defaults(func=cmd_status)
 
     # 2. pipeline export --session <ID> --from [device|cloud]
@@ -295,6 +367,12 @@ def build_parser() -> argparse.ArgumentParser:
         dest="db",
         default=None,
         help="Path to pipeline SQLite database file",
+    )
+    p_export.add_argument(
+        "--cloud-url",
+        dest="cloud_url",
+        default=None,
+        help="URL of the cloud receiver service",
     )
     p_export.set_defaults(func=cmd_export)
 

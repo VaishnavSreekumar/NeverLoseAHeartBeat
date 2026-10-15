@@ -599,6 +599,7 @@ def process_window(
     session_id: Optional[str] = None,
     mode: str = "offline",
     accepted_peaks_history: Optional[Sequence[int]] = None,
+    skip_validation: bool = False,
 ) -> WindowResult:
     """Process a single 1-second window w conforming strictly to Section 3.
 
@@ -610,6 +611,8 @@ def process_window(
         session_id: Optional session identifier.
         mode: 'online' or 'offline'.
         accepted_peaks_history: Optional precomputed accepted peaks across the session.
+        skip_validation: If True, assumes sensor1_samples and sensor2_samples are pre-normalized
+            and loss consistency has already been verified for this batch.
 
     Returns:
         WindowResult containing Section 3 outputs.
@@ -620,14 +623,18 @@ def process_window(
     """
     start_idx, end_idx = get_window_bounds(window)
 
-    # 1. Normalize and validate inputs
-    s1_map = normalize_sensor_samples(sensor1_samples, expected_sensor=1)
-    s2_map = normalize_sensor_samples(sensor2_samples, expected_sensor=2)
+    if not skip_validation:
+        # 1. Normalize and validate inputs
+        s1_map = normalize_sensor_samples(sensor1_samples, expected_sensor=1)
+        s2_map = normalize_sensor_samples(sensor2_samples, expected_sensor=2)
 
-    # Validate loss ledger consistency (reject contradictions between samples and loss)
-    if loss_ranges:
-        validate_loss_consistency(sensor=1, available_indices=set(s1_map.keys()), loss_ranges=loss_ranges)
-        validate_loss_consistency(sensor=2, available_indices=set(s2_map.keys()), loss_ranges=loss_ranges)
+        # Validate loss ledger consistency (reject contradictions between samples and loss)
+        if loss_ranges:
+            validate_loss_consistency(sensor=1, available_indices=set(s1_map.keys()), loss_ranges=loss_ranges)
+            validate_loss_consistency(sensor=2, available_indices=set(s2_map.keys()), loss_ranges=loss_ranges)
+    else:
+        s1_map = sensor1_samples  # type: ignore[assignment]
+        s2_map = sensor2_samples  # type: ignore[assignment]
 
     # 2. Determine available and missing indices in window [400*w, 400*w + 399]
     s1_available_in_window: list[Sequence[int]] = []
@@ -793,6 +800,7 @@ class SignalProcessingEngine:
         sensor2_samples: Union[Mapping[int, Sequence[int]], Sequence[Sample]],
         loss_ranges: Optional[Sequence[LossRange]] = None,
         session_id: Optional[str] = None,
+        skip_validation: bool = False,
     ) -> WindowResult:
         """Process window w using accumulated peak history.
 
@@ -803,6 +811,7 @@ class SignalProcessingEngine:
             loss_ranges: Optional sequence of LossRange objects.
             session_id: Optional session ID. If different from current session,
                 the engine state is automatically reset for the new session.
+            skip_validation: If True, skips redundant per-window normalization and loss checks.
 
         Returns:
             WindowResult with Section 3 metrics.
@@ -826,6 +835,7 @@ class SignalProcessingEngine:
             session_id=effective_session_id,
             mode=self.mode,
             accepted_peaks_history=self._accepted_peaks,
+            skip_validation=skip_validation,
         )
 
     def process_windows(
@@ -848,14 +858,22 @@ class SignalProcessingEngine:
         Returns:
             List of WindowResult objects corresponding to windows.
         """
+        # Pre-normalize and validate once for the entire window sequence
+        s1_map = normalize_sensor_samples(sensor1_samples, expected_sensor=1)
+        s2_map = normalize_sensor_samples(sensor2_samples, expected_sensor=2)
+        if loss_ranges:
+            validate_loss_consistency(sensor=1, available_indices=set(s1_map.keys()), loss_ranges=loss_ranges)
+            validate_loss_consistency(sensor=2, available_indices=set(s2_map.keys()), loss_ranges=loss_ranges)
+
         results: list[WindowResult] = []
         for w in sorted(windows):
             res = self.process_window(
                 window=w,
-                sensor1_samples=sensor1_samples,
-                sensor2_samples=sensor2_samples,
+                sensor1_samples=s1_map,
+                sensor2_samples=s2_map,
                 loss_ranges=loss_ranges,
                 session_id=session_id,
+                skip_validation=True,
             )
             results.append(res)
         return results

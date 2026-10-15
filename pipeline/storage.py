@@ -69,6 +69,17 @@ class CheckpointRecord:
         return self.contiguous_resolved_index + 1
 
 
+@dataclass(frozen=True)
+class CloudReplicationCheckpoint:
+    """Committed cloud replication state for a specific (session_id, sensor) stream."""
+    session_id: str
+    sensor: int
+    cloud_persisted_index: int
+    cloud_resolved_index: int
+    highest_observed_index: int
+    last_acked_at: float
+
+
 @dataclass
 class StorageTelemetry:
     """Operational metrics for the storage engine."""
@@ -194,6 +205,18 @@ class StorageEngine:
                     );
                 """)
 
+                cursor.execute("""
+                    CREATE TABLE IF NOT EXISTS cloud_checkpoints (
+                        session_id TEXT NOT NULL,
+                        sensor INTEGER NOT NULL CHECK (sensor IN (1, 2)),
+                        cloud_persisted_index INTEGER NOT NULL DEFAULT -1,
+                        cloud_resolved_index INTEGER NOT NULL DEFAULT -1,
+                        highest_observed_index INTEGER NOT NULL DEFAULT -1,
+                        last_acked_at REAL NOT NULL,
+                        PRIMARY KEY (session_id, sensor)
+                    );
+                """)
+
                 # Indexes for high-throughput contiguous cursor queries
                 cursor.execute("""
                     CREATE INDEX IF NOT EXISTS idx_samples_cursor 
@@ -202,6 +225,10 @@ class StorageEngine:
                 cursor.execute("""
                     CREATE INDEX IF NOT EXISTS idx_loss_cursor 
                     ON loss_ledger (session_id, sensor, from_index, to_index);
+                """)
+                cursor.execute("""
+                    CREATE INDEX IF NOT EXISTS idx_cloud_checkpoints
+                    ON cloud_checkpoints (session_id, sensor);
                 """)
             finally:
                 cursor.close()
@@ -778,36 +805,43 @@ class StorageEngine:
                         (s_id, sensor),
                     )
                     sample_rows = cursor.fetchall()
+                    sample_indices = set()
                     for s_row in sample_rows:
-                        if s_row["sample_index"] == persisted + 1:
-                            persisted = s_row["sample_index"]
-                        elif s_row["sample_index"] > persisted + 1:
-                            break
+                        s_idx = s_row["sample_index"]
+                        sample_indices.add(s_idx)
+                        if s_idx == persisted + 1:
+                            persisted = s_idx
+
+                    # Fetch bounded loss intervals for this stream
+                    cursor.execute(
+                        """
+                        SELECT from_index, to_index FROM loss_ledger
+                        WHERE session_id = ? AND sensor = ? AND to_index IS NOT NULL
+                        ORDER BY from_index ASC;
+                        """,
+                        (s_id, sensor),
+                    )
+                    loss_intervals = [
+                        (l_row["from_index"], l_row["to_index"])
+                        for l_row in cursor.fetchall()
+                    ]
 
                     # 2. Authoritative contiguous resolved index (samples + authoritative loss)
                     # By monotonic invariant, resolved >= persisted; samples 0..persisted are guaranteed present.
                     resolved = persisted
                     while True:
                         cand = resolved + 1
-                        cursor.execute(
-                            "SELECT 1 FROM samples WHERE session_id = ? AND sensor = ? AND sample_index = ?;",
-                            (s_id, sensor, cand),
-                        )
-                        if cursor.fetchone():
+                        if cand in sample_indices:
                             resolved = cand
                             continue
 
-                        cursor.execute(
-                            """
-                            SELECT to_index FROM loss_ledger
-                            WHERE session_id = ? AND sensor = ? AND from_index <= ? AND to_index >= ?
-                            ORDER BY from_index ASC LIMIT 1;
-                            """,
-                            (s_id, sensor, cand, cand),
-                        )
-                        l_row = cursor.fetchone()
-                        if l_row and l_row["to_index"] is not None and l_row["to_index"] >= cand:
-                            resolved = l_row["to_index"]
+                        matched = False
+                        for f_idx, t_idx in loss_intervals:
+                            if f_idx <= cand <= t_idx:
+                                resolved = t_idx
+                                matched = True
+                                break
+                        if matched:
                             continue
                         break
 
@@ -900,5 +934,288 @@ class StorageEngine:
                     )
 
                 return authoritative
+            finally:
+                cursor.close()
+
+    def get_cloud_checkpoint(self, session_id: str, sensor: int) -> CloudReplicationCheckpoint:
+        """Fetch the durable committed cloud replication checkpoint for (session_id, sensor)."""
+        with self._lock:
+            cursor = self._conn.cursor()
+            try:
+                cursor.execute(
+                    """
+                    SELECT cloud_persisted_index, cloud_resolved_index,
+                           highest_observed_index, last_acked_at
+                    FROM cloud_checkpoints
+                    WHERE session_id = ? AND sensor = ?;
+                    """,
+                    (session_id, sensor),
+                )
+                row = cursor.fetchone()
+                if row:
+                    return CloudReplicationCheckpoint(
+                        session_id=session_id,
+                        sensor=sensor,
+                        cloud_persisted_index=row["cloud_persisted_index"],
+                        cloud_resolved_index=row["cloud_resolved_index"],
+                        highest_observed_index=row["highest_observed_index"],
+                        last_acked_at=row["last_acked_at"],
+                    )
+                return CloudReplicationCheckpoint(
+                    session_id=session_id,
+                    sensor=sensor,
+                    cloud_persisted_index=-1,
+                    cloud_resolved_index=-1,
+                    highest_observed_index=-1,
+                    last_acked_at=0.0,
+                )
+            finally:
+                cursor.close()
+
+    def update_cloud_checkpoint(
+        self,
+        session_id: str,
+        sensor: int,
+        cloud_persisted_index: int,
+        cloud_resolved_index: int,
+        highest_observed_index: int,
+        last_acked_at: Optional[float] = None,
+        acked_at: Optional[float] = None,
+    ) -> CloudReplicationCheckpoint:
+        """Atomically upsert the verified cloud acknowledgement cursors."""
+        effective_acked_at = last_acked_at if last_acked_at is not None else (acked_at if acked_at is not None else time.time())
+        with self._lock:
+            cursor = self._conn.cursor()
+            try:
+                cursor.execute("BEGIN IMMEDIATE;")
+                cursor.execute(
+                    """
+                    INSERT INTO cloud_checkpoints (
+                        session_id, sensor, cloud_persisted_index,
+                        cloud_resolved_index, highest_observed_index, last_acked_at
+                    )
+                    VALUES (?, ?, ?, ?, ?, ?)
+                    ON CONFLICT(session_id, sensor) DO UPDATE SET
+                        cloud_persisted_index = excluded.cloud_persisted_index,
+                        cloud_resolved_index = excluded.cloud_resolved_index,
+                        highest_observed_index = excluded.highest_observed_index,
+                        last_acked_at = excluded.last_acked_at;
+                    """,
+                    (
+                        session_id,
+                        sensor,
+                        cloud_persisted_index,
+                        cloud_resolved_index,
+                        highest_observed_index,
+                        effective_acked_at,
+                    ),
+                )
+                cursor.execute("COMMIT;")
+                return CloudReplicationCheckpoint(
+                    session_id=session_id,
+                    sensor=sensor,
+                    cloud_persisted_index=cloud_persisted_index,
+                    cloud_resolved_index=cloud_resolved_index,
+                    highest_observed_index=highest_observed_index,
+                    last_acked_at=last_acked_at,
+                )
+            except Exception:
+                try:
+                    cursor.execute("ROLLBACK;")
+                except Exception:
+                    pass
+                raise
+            finally:
+                cursor.close()
+
+    def get_all_cloud_checkpoints(self) -> list[CloudReplicationCheckpoint]:
+        """Fetch all stored cloud replication checkpoints."""
+        with self._lock:
+            cursor = self._conn.cursor()
+            try:
+                cursor.execute("""
+                    SELECT session_id, sensor, cloud_persisted_index,
+                           cloud_resolved_index, highest_observed_index, last_acked_at
+                    FROM cloud_checkpoints
+                    ORDER BY session_id, sensor;
+                """)
+                return [
+                    CloudReplicationCheckpoint(
+                        session_id=row["session_id"],
+                        sensor=row["sensor"],
+                        cloud_persisted_index=row["cloud_persisted_index"],
+                        cloud_resolved_index=row["cloud_resolved_index"],
+                        highest_observed_index=row["highest_observed_index"],
+                        last_acked_at=row["last_acked_at"],
+                    )
+                    for row in cursor.fetchall()
+                ]
+            finally:
+                cursor.close()
+
+    def get_active_sessions(self) -> list[str]:
+        """Return list of distinct session IDs recorded in local storage."""
+        with self._lock:
+            cursor = self._conn.cursor()
+            try:
+                cursor.execute("""
+                    SELECT session_id FROM sessions
+                    UNION
+                    SELECT DISTINCT session_id FROM samples
+                    UNION
+                    SELECT DISTINCT session_id FROM loss_ledger
+                    ORDER BY session_id;
+                """)
+                return [row["session_id"] for row in cursor.fetchall()]
+            finally:
+                cursor.close()
+
+    def get_replication_backlog(self, session_id: Optional[str] = None) -> int:
+        """Count total local samples not yet acknowledged by cloud."""
+        with self._lock:
+            cursor = self._conn.cursor()
+            try:
+                query = "SELECT DISTINCT session_id, sensor FROM checkpoints"
+                params: list[Any] = []
+                if session_id:
+                    query += " WHERE session_id = ?"
+                    params.append(session_id)
+                cursor.execute(query, params)
+                streams = cursor.fetchall()
+                total_backlog = 0
+                for s in streams:
+                    s_id = s["session_id"]
+                    sens = s["sensor"]
+                    cloud_ckpt = self.get_cloud_checkpoint(s_id, sens)
+                    cursor.execute(
+                        """
+                        SELECT COUNT(*) AS cnt FROM samples
+                        WHERE session_id = ? AND sensor = ? AND sample_index > ?;
+                        """,
+                        (s_id, sens, cloud_ckpt.cloud_resolved_index),
+                    )
+                    row = cursor.fetchone()
+                    total_backlog += row["cnt"] if row else 0
+                return total_backlog
+            finally:
+                cursor.close()
+
+    def get_unreplicated_batch(
+        self,
+        session_id: str,
+        sensor: int,
+        max_samples: int = 400,
+    ) -> Optional[IngestBatch]:
+        """Construct the next bounded IngestBatch to send to the cloud receiver.
+
+        Enforces:
+        - Strict contiguous traversal starting from cloud_resolved_index + 1.
+        - Immediate forwarding of authoritative loss records before subsequent samples.
+        - Correct channel layout (3 for sensor 1, 2 for sensor 2).
+        - Clean session_end detection upon full stream reconciliation.
+        """
+        with self._lock:
+            cursor = self._conn.cursor()
+            try:
+                cloud_ckpt = self.get_cloud_checkpoint(session_id, sensor)
+                local_ckpt = self.get_checkpoint(session_id, sensor)
+
+                if local_ckpt.highest_observed_index < 0:
+                    return None
+
+                next_idx = cloud_ckpt.cloud_resolved_index + 1
+
+                # If cloud already caught up to local resolved cursor
+                if next_idx > local_ckpt.contiguous_resolved_index:
+                    return None
+
+                # Check if next_idx is covered by an authoritative loss record
+                cursor.execute(
+                    """
+                    SELECT from_index, to_index, reason FROM loss_ledger
+                    WHERE session_id = ? AND sensor = ?
+                      AND from_index <= ? AND (to_index IS NULL OR to_index >= ?)
+                    ORDER BY from_index ASC LIMIT 1;
+                    """,
+                    (session_id, sensor, next_idx, next_idx),
+                )
+                loss_row = cursor.fetchone()
+                if loss_row:
+                    lr = LossRecord(
+                        from_index=loss_row["from_index"],
+                        to_index=loss_row["to_index"],
+                        reason=loss_row["reason"],
+                    )
+                    return IngestBatch(
+                        session_id=session_id,
+                        sensor=sensor,
+                        first_index=lr.from_index,
+                        count=0,
+                        data=[],
+                        lost=[lr],
+                        session_end=False,
+                        crc32="",
+                    )
+
+                # Otherwise, fetch contiguous samples starting at next_idx
+                cursor.execute(
+                    """
+                    SELECT sample_index, ch1, ch2, ch3 FROM samples
+                    WHERE session_id = ? AND sensor = ? AND sample_index >= ?
+                    ORDER BY sample_index ASC LIMIT ?;
+                    """,
+                    (session_id, sensor, next_idx, max_samples),
+                )
+                sample_rows = cursor.fetchall()
+                if not sample_rows:
+                    return None
+
+                # Check if a loss record starts within this range to prevent crossing loss boundaries
+                cursor.execute(
+                    """
+                    SELECT MIN(from_index) AS min_loss FROM loss_ledger
+                    WHERE session_id = ? AND sensor = ? AND from_index >= ?;
+                    """,
+                    (session_id, sensor, next_idx),
+                )
+                min_loss_row = cursor.fetchone()
+                min_loss_idx = min_loss_row["min_loss"] if min_loss_row and min_loss_row["min_loss"] is not None else float("inf")
+
+                contiguous_samples: list[list[int]] = []
+                expected_idx = next_idx
+                for s in sample_rows:
+                    s_idx = s["sample_index"]
+                    if s_idx != expected_idx or s_idx >= min_loss_idx:
+                        break
+                    if sensor == 1:
+                        contiguous_samples.append([s["ch1"], s["ch2"], s["ch3"]])
+                    else:
+                        contiguous_samples.append([s["ch1"], s["ch2"]])
+                    expected_idx += 1
+
+                if not contiguous_samples:
+                    return None
+
+                # Check if session clean shutdown recorded and this batch completes stream
+                session_end = False
+                if expected_idx - 1 >= local_ckpt.contiguous_resolved_index:
+                    cursor.execute(
+                        "SELECT clean_shutdown FROM sessions WHERE session_id = ?;",
+                        (session_id,),
+                    )
+                    s_row = cursor.fetchone()
+                    if s_row and s_row["clean_shutdown"]:
+                        session_end = True
+
+                return IngestBatch(
+                    session_id=session_id,
+                    sensor=sensor,
+                    first_index=next_idx,
+                    count=len(contiguous_samples),
+                    data=contiguous_samples,
+                    lost=[],
+                    session_end=session_end,
+                    crc32="",
+                )
             finally:
                 cursor.close()

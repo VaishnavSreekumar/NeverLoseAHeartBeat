@@ -1,0 +1,39 @@
+{
+  "timestamp": 1792107131.1130748,
+  "platform": "Windows-11-10.0.26200-SP0",
+  "processor": "Intel64 Family 6 Model 183 Stepping 1, GenuineIntel",
+  "session_id": "sess_2hr_benchmark_run",
+  "index_space_covered": 5760000,
+  "physical_samples_replicated": 16000,
+  "elapsed_seconds": 60.1417,
+  "target_max_seconds": 900.0,
+  "meets_15min_target": true,
+  "samples_per_second": 266.04,
+  "indices_per_second": 95773.76,
+  "initial_rss_mb": 52.08,
+  "peak_rss_mb": 85.99,
+  "reconciliation_status": "RECONCILED",
+  "total_discrepancies": 0,
+  "streams": [
+    {
+      "sensor": 1,
+      "device_samples": 8000,
+      "cloud_samples": 8000,
+      "matched_samples": 8000,
+      "device_losses": 1,
+      "cloud_losses": 1,
+      "cloud_resolved_index": 2879999,
+      "is_consistent": true
+    },
+    {
+      "sensor": 2,
+      "device_samples": 8000,
+      "cloud_samples": 8000,
+      "matched_samples": 8000,
+      "device_losses": 1,
+      "cloud_losses": 1,
+      "cloud_resolved_index": 2879999,
+      "is_consistent": true
+    }
+  ]
+}
