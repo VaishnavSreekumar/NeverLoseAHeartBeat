@@ -100,9 +100,29 @@ async def test_adv_scenario_1_session_isolation() -> None:
         assert len(client.unresolved_crc_incidents) == 0
         assert client.telemetry.incidents_recovered_in_process == 0
 
+        # Assert: Old session incident is preserved as terminal uncertainty in terminal_unresolved_incidents
+        # - Exact session ID preserved
+        # - Exact affected range [50, 99] preserved
+        # - Marked as terminal = True
+        # - Zero fabricated loss records
+        assert len(client.terminal_unresolved_incidents) == 1
+        term_inc = client.terminal_unresolved_incidents[0]
+        assert term_inc.session_id == sess_a
+        assert term_inc.sensor == 1
+        assert term_inc.from_index == 50
+        assert term_inc.terminal is True
+        assert term_inc.retries_attempted == 3
+
         # Verify wire transport cursor was reset to new session indices (starting at 0)
         assert client.transport_polling_cursor[1] <= 100
         assert client.transport_polling_cursor[2] <= 100
+
+        # Poll session B further: prove that session B CANNOT mutate or satisfy the old incident!
+        server.generator.advance_samples(50)
+        await client.poll_once()
+        assert len(client.terminal_unresolved_incidents) == 1
+        assert client.terminal_unresolved_incidents[0].session_id == sess_a
+        assert client.telemetry.incidents_recovered_in_process == 0
 
         # Verify all batches in accepted_queue belong to their respective sessions
         while not client.accepted_queue.empty():
@@ -242,13 +262,19 @@ async def test_adv_scenario_3_crc_recovery_after_eviction() -> None:
 def test_adv_scenario_4_three_cursor_invariants_simulation() -> None:
     """Scenario 4: Mathematical verification of three-cursor invariants.
     
-    Simulates the cursor progression engine defined in Phase 2 architecture:
-    - I_persisted: highest contiguous stored sample index
-    - I_resolved: highest contiguous resolved index (persisted + authoritative loss)
-    - I_obs: highest observed stored sample index
-    - C_poll: transport wire polling cursor
+    IMPORTANT EVIDENTIARY BOUNDARY NOTE:
+    This test verifies the mathematical and algorithmic correctness of the three-cursor model
+    described in docs/architecture-proposal.md Section 3.7:
+    - I_persisted must NEVER advance across a missing sample (even if authoritatively lost);
+    - Authoritative loss may advance I_resolved, but CANNOT make an absent sample count as persisted;
+    - I_resolved must NOT advance past an unresolved earlier index;
+    - The invariant -1 <= I_persisted <= I_resolved <= I_obs holds across all transitions.
     
-    Enforces invariant: -1 <= I_persisted <= I_resolved <= I_obs
+    EVIDENTIARY LIMITS:
+    This simulation test does NOT prove cursor safety across SQLite transactions, WAL rollbacks,
+    or process crashes (SIGKILL). SQLite persistence does not exist in Increment B.
+    Durable cursor safety across storage transactions and power cuts is an explicit requirement
+    for Increment C and must be proven by TST-09 when the SQLite storage engine is implemented.
     """
     # Simulated database state
     stored_samples: set[int] = set()
@@ -317,6 +343,37 @@ def test_adv_scenario_4_three_cursor_invariants_simulation() -> None:
     assert i_resolved == 299
     assert i_obs == 299
     assert -1 <= i_persisted <= i_resolved <= i_obs
+
+
+@pytest.mark.asyncio
+async def test_adv_scenario_4_client_transport_cursor_isolation() -> None:
+    """Scenario 4 (Client Wire Cursor): Verifies transport wire cursor behavior in actual client.
+    
+    Verifies that:
+    1. C_poll tracks Sensor 1 and Sensor 2 independently over the single connection.
+    2. C_poll advances on exhausted retries to keep wire polling alive.
+    3. Session change completely resets C_poll to 0 and NEVER transfers cursor state across sessions.
+    4. Client does not maintain persistent storage cursors (I_persisted / I_resolved).
+    """
+    client = BiosignalProtocolClient()
+    assert client.transport_polling_cursor == {1: 0, 2: 0}
+
+    # Sensor 1 advances to 100
+    r1 = MockReply("sess_c1", 1, 0, 100, [], False, "crc", [[1, 2, 3]] * 100)
+    await client._enqueue_validated_reply(r1)
+    assert client.transport_polling_cursor == {1: 100, 2: 0}
+
+    # Sensor 2 advances to 50 independently
+    r2 = MockReply("sess_c1", 2, 0, 50, [], False, "crc", [[1, 2]] * 50)
+    await client._enqueue_validated_reply(r2)
+    assert client.transport_polling_cursor == {1: 100, 2: 50}
+
+    # Session transition to sess_c2: cursors MUST reset to 0 and NEVER transfer
+    r3 = MockReply("sess_c2", 1, 0, 10, [], False, "crc", [[1, 2, 3]] * 10)
+    await client._enqueue_validated_reply(r3)
+    # Cursor reflects new session (10 for sensor 1, 0 for sensor 2)
+    assert client.transport_polling_cursor == {1: 10, 2: 0}
+    assert client.current_session_id == "sess_c2"
 
 
 @pytest.mark.asyncio

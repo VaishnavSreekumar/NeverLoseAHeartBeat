@@ -79,6 +79,7 @@ class UnresolvedCrcIncident:
     to_index: Optional[int]
     first_failed_at: float = field(default_factory=time.time)
     retries_attempted: int = 0
+    terminal: bool = False  # Set to True when source session ends without resolution
 
 
 @dataclass
@@ -140,14 +141,22 @@ class BiosignalProtocolClient:
         # Bounded downstream queue for validated response batches
         self.accepted_queue: asyncio.Queue[IngestBatch] = asyncio.Queue(maxsize=queue_maxsize)
 
-        # Quarantined transport incidents (unresolved CRC errors)
+        # Quarantined transport incidents for the current session (eligible for in-process sweep)
         self.unresolved_crc_incidents: list[UnresolvedCrcIncident] = []
+
+        # Archived terminal incidents from previous sessions preserved as permanent uncertainty
+        # (Preserves session_id and affected range; not eligible for sweep by new session)
+        self.terminal_unresolved_incidents: list[UnresolvedCrcIncident] = []
 
         # Transport wire polling cursor (ephemeral, distinct from storage recovery cursor)
         self.transport_polling_cursor: dict[int, int] = {1: 0, 2: 0}
 
         # Bounded cache of recent samples for duplicate integrity validation:
         # Key: (session_id, sensor, sample_index) -> Value: list[int] channel values
+        # NOTE: This cache is bounded to 10,000 samples (~12.5s dual-sensor window) to satisfy
+        # the ARM64 memory bound (REQ-H-02). Durable, full-history duplicate-conflict detection
+        # across arbitrary time horizons MUST be enforced by Increment C at the SQLite storage layer
+        # via PRIMARY KEY (session_id, sensor, sample_index).
         self._recent_samples: dict[tuple[str, int, int], list[int]] = {}
         self._recent_sample_keys: deque[tuple[str, int, int]] = deque()
         self._max_recent_samples: int = 10000
@@ -256,12 +265,17 @@ class BiosignalProtocolClient:
                 f"Session transition detected: {self.current_session_id} -> {new_session_id}. "
                 "Preserving terminal uncertainty for previous session."
             )
+            # Archive unrecovered incidents from previous session as terminal uncertainty
+            # Prevents silent erasure; preserves session_id and affected range untouched
+            for inc in self.unresolved_crc_incidents:
+                inc.terminal = True
+                self.terminal_unresolved_incidents.append(inc)
+            self.unresolved_crc_incidents.clear()
+
             self.current_session_id = new_session_id
             # Reset wire transport cursors for new session
             self.transport_polling_cursor[1] = 0
             self.transport_polling_cursor[2] = 0
-            # Quarantined incidents from previous session are cleared from memory
-            self.unresolved_crc_incidents.clear()
             # Clear recent sample cache for new session
             self._recent_samples.clear()
             self._recent_sample_keys.clear()
@@ -424,13 +438,15 @@ class BiosignalProtocolClient:
 
         incident = self.unresolved_crc_incidents[0]
 
-        # Guard: If incident belongs to an old session, it cannot be recovered by the current session.
+        # Guard: If incident belongs to an old session, archive it to terminal_unresolved_incidents
         if self.current_session_id is not None and incident.session_id != self.current_session_id:
             logger.info(
-                f"Discarding quarantined incident from prior session {incident.session_id} "
+                f"Archiving quarantined incident from prior session {incident.session_id} as terminal uncertainty "
                 f"(current session is {self.current_session_id})."
             )
-            self.unresolved_crc_incidents.pop(0)
+            old_inc = self.unresolved_crc_incidents.pop(0)
+            old_inc.terminal = True
+            self.terminal_unresolved_incidents.append(old_inc)
             return
 
         logger.debug(
