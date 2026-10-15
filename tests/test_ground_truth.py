@@ -64,11 +64,11 @@ def test_silent_loss_detection() -> None:
 
 
 def test_explicit_loss_reconciliation() -> None:
-    """Verifies that missing sample covered by explicit loss record is accepted."""
+    """Verifies that missing sample covered by substantiated mock loss record is accepted."""
     gt_lines = [
         json.dumps({"session_id": "s1", "sensor": 1, "index": 0, "values": [0, 1, 2]}),
-        json.dumps({"session_id": "s1", "sensor": 1, "index": 1, "values": [3, 4, 5]}),
-        json.dumps({"session_id": "s1", "sensor": 1, "index": 2, "values": [6, 7, 8]}),
+        # Ground truth records an actual buffer drop for indices 1 to 2
+        json.dumps({"session_id": "s1", "event": "buffer_drop", "sensor": 1, "from_index": 1, "to_index": 2, "reason": "buffer_overflow"}),
     ]
     export_lines = [
         json.dumps({"sensor": 1, "index": 0, "values": [0, 1, 2]}),
@@ -79,6 +79,83 @@ def test_explicit_loss_reconciliation() -> None:
     report = audit_export_against_ground_truth(gt_lines, export_lines)
     assert report.is_clean is True
     assert report.missing_samples == 0
+    assert report.unaccounted_loss_samples == 0
+
+
+def test_unsupported_mock_loss_detection() -> None:
+    """Verifies AUDIT-04: pipeline claiming mock buffer_overflow when no drop occurred is flagged."""
+    gt_lines = [
+        json.dumps({"session_id": "s1", "sensor": 1, "index": 0, "values": [0, 1, 2]}),
+        json.dumps({"session_id": "s1", "sensor": 1, "index": 1, "values": [3, 4, 5]}),
+        json.dumps({"session_id": "s1", "sensor": 1, "index": 2, "values": [6, 7, 8]}),
+    ]
+    export_lines = [
+        json.dumps({"sensor": 1, "index": 0, "values": [0, 1, 2]}),
+        # Pipeline claims mock overflow for 1..2, but ground truth shows samples were generated and NOT dropped
+        json.dumps({"sensor": 1, "from_index": 1, "to_index": 2, "reason": "buffer_overflow"}),
+    ]
+
+    report = audit_export_against_ground_truth(gt_lines, export_lines)
+    assert report.is_clean is False
+    assert report.unaccounted_loss_samples == 2
+    assert any("UNSUPPORTED LOSS DEFECT" in d for d in report.defects)
+    assert any("SILENT LOSS DEFECT" in d for d in report.defects)
+
+
+def test_contradictory_loss_detection() -> None:
+    """Verifies AUDIT-04: exporting sample data while simultaneously claiming it lost is flagged."""
+    gt_lines = [
+        json.dumps({"session_id": "s1", "sensor": 1, "index": 0, "values": [0, 1, 2]}),
+        json.dumps({"session_id": "s1", "sensor": 1, "index": 1, "values": [3, 4, 5]}),
+    ]
+    export_lines = [
+        # Exported sample 1
+        json.dumps({"sensor": 1, "index": 0, "values": [0, 1, 2]}),
+        json.dumps({"sensor": 1, "index": 1, "values": [3, 4, 5]}),
+        # But also claimed index 1 was lost in a span!
+        json.dumps({"sensor": 1, "from_index": 1, "to_index": 2, "reason": "device_error"}),
+    ]
+
+    report = audit_export_against_ground_truth(gt_lines, export_lines)
+    assert report.is_clean is False
+    assert any("CONTRADICTORY LOSS DEFECT" in d for d in report.defects)
+
+
+def test_duplicate_loss_record_detection() -> None:
+    """Verifies AUDIT-04: identical loss span exported multiple times is flagged."""
+    gt_lines = [
+        json.dumps({"session_id": "s1", "sensor": 1, "index": 0, "values": [0, 1, 2]}),
+        json.dumps({"session_id": "s1", "event": "buffer_drop", "sensor": 1, "from_index": 1, "to_index": 2, "reason": "buffer_overflow"}),
+    ]
+    export_lines = [
+        json.dumps({"sensor": 1, "index": 0, "values": [0, 1, 2]}),
+        json.dumps({"sensor": 1, "from_index": 1, "to_index": 2, "reason": "buffer_overflow"}),
+        json.dumps({"sensor": 1, "from_index": 1, "to_index": 2, "reason": "buffer_overflow"}),  # Duplicate!
+    ]
+
+    report = audit_export_against_ground_truth(gt_lines, export_lines)
+    assert report.is_clean is False
+    assert report.duplicate_samples == 1
+    assert any("DUPLICATE LOSS DEFECT" in d for d in report.defects)
+
+
+def test_device_side_loss_reconciliation() -> None:
+    """Verifies AUDIT-04: pipeline crash/local loss is accepted as legitimate non-silent loss."""
+    gt_lines = [
+        json.dumps({"session_id": "s1", "sensor": 1, "index": 0, "values": [0, 1, 2]}),
+        json.dumps({"session_id": "s1", "sensor": 1, "index": 1, "values": [3, 4, 5]}),
+        json.dumps({"session_id": "s1", "sensor": 1, "index": 2, "values": [6, 7, 8]}),
+    ]
+    export_lines = [
+        json.dumps({"sensor": 1, "index": 0, "values": [0, 1, 2]}),
+        # Pipeline lost samples 1..2 due to local power cut / reboot
+        json.dumps({"sensor": 1, "from_index": 1, "to_index": 2, "reason": "power_cut"}),
+    ]
+
+    report = audit_export_against_ground_truth(gt_lines, export_lines)
+    assert report.is_clean is True
+    assert report.missing_samples == 0
+    assert report.unaccounted_loss_samples == 0
 
 
 def test_duplicate_sample_detection() -> None:

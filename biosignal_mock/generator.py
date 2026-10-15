@@ -51,11 +51,24 @@ class DualSensorGenerator:
         self.is_session_ended: bool = False
 
         # Independent ring buffers for Sensor 1 and Sensor 2
-        self.buffer_s1 = SensorRingBuffer(sensor=1, capacity=buffer_capacity)
-        self.buffer_s2 = SensorRingBuffer(sensor=2, capacity=buffer_capacity)
+        self.buffer_s1 = SensorRingBuffer(sensor=1, capacity=buffer_capacity, on_drop=self._on_buffer_drop)
+        self.buffer_s2 = SensorRingBuffer(sensor=2, capacity=buffer_capacity, on_drop=self._on_buffer_drop)
 
         # Active sensor stalls: sensor_id -> (start_idx, end_idx)
         self._stalls: dict[int, tuple[int, int]] = {}
+
+    def _on_buffer_drop(self, sensor: int, dropped_idx: int) -> None:
+        """Invoked when ring buffer drops a sample due to overflow."""
+        if self.ground_truth_tap:
+            self.ground_truth_tap({
+                "session_id": self.session_id,
+                "event": "buffer_drop",
+                "sensor": sensor,
+                "from_index": dropped_idx,
+                "to_index": dropped_idx,
+                "reason": "buffer_overflow",
+                "timestamp": time.time(),
+            })
 
     @staticmethod
     def _generate_session_id() -> str:
@@ -69,8 +82,8 @@ class DualSensorGenerator:
         self.current_index = 0
         self.is_session_ended = False
         self._stalls.clear()
-        self.buffer_s1 = SensorRingBuffer(sensor=1, capacity=self.buffer_capacity)
-        self.buffer_s2 = SensorRingBuffer(sensor=2, capacity=self.buffer_capacity)
+        self.buffer_s1 = SensorRingBuffer(sensor=1, capacity=self.buffer_capacity, on_drop=self._on_buffer_drop)
+        self.buffer_s2 = SensorRingBuffer(sensor=2, capacity=self.buffer_capacity, on_drop=self._on_buffer_drop)
 
         if self.ground_truth_tap:
             self.ground_truth_tap({

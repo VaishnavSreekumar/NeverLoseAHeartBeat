@@ -112,8 +112,12 @@ def audit_export_against_ground_truth(
             gt_drops[sid] = []
 
         event = entry.get("event")
-        if event == "buffer_drop":
-            gt_drops[sid].append((int(entry["sensor"]), int(entry["from_index"]), int(entry["to_index"])))
+        if event in ("buffer_drop", "sensor_stall"):
+            s = int(entry["sensor"])
+            f = int(entry.get("from_index", entry.get("index", 0)))
+            t = int(entry.get("to_index", f))
+            r = str(entry.get("reason", event))
+            gt_drops[sid].append((s, f, t, r))
         elif "index" in entry and "values" in entry:
             key = (int(entry["sensor"]), int(entry["index"]))
             gt_sessions[sid][key] = entry["values"]
@@ -141,11 +145,13 @@ def audit_export_against_ground_truth(
             return report
 
     gt_samples = gt_sessions.get(target_session, {}) if target_session else {}
+    target_gt_drops = gt_drops.get(target_session, []) if target_session else []
     report.total_ground_truth = len(gt_samples)
 
     # Step 3: Ingest and validate export stream
     seen_export_keys: set[tuple[int, int]] = set()
-    exported_losses: list[tuple[int, int, Optional[int]]] = []
+    seen_loss_spans: set[tuple[int, int, Optional[int]]] = set()
+    exported_losses: list[tuple[int, int, Optional[int], str]] = []
 
     for line in export_lines:
         line = line.strip()
@@ -164,7 +170,17 @@ def audit_export_against_ground_truth(
             to_idx = entry.get("to_index")
             if to_idx is not None:
                 to_idx = int(to_idx)
-            exported_losses.append((sensor, from_idx, to_idx))
+            reason = str(entry.get("reason", "unknown"))
+
+            loss_key = (sensor, from_idx, to_idx)
+            if loss_key in seen_loss_spans:
+                report.duplicate_samples += 1
+                report.defects.append(
+                    f"DUPLICATE LOSS DEFECT: loss span [{from_idx}, {to_idx}] for sensor {sensor} exported multiple times."
+                )
+                continue
+            seen_loss_spans.add(loss_key)
+            exported_losses.append((sensor, from_idx, to_idx, reason))
             continue
 
         # Case B: Sample record
@@ -208,24 +224,56 @@ def audit_export_against_ground_truth(
                     f"Expected {gt_val}, got {values}."
                 )
 
-    # Step 4: Missing samples detection
+    # Step 4: Validate exported losses against ground truth drops
+    unsupported_loss_spans: set[tuple[int, int, Optional[int]]] = set()
+    for exp_sensor, exp_from, exp_to, exp_reason in exported_losses:
+        # Check contradictory loss: sample exported as valid data but also claimed lost
+        if exp_to is not None:
+            contradictory = [idx for idx in range(exp_from, exp_to + 1) if (exp_sensor, idx) in seen_export_keys]
+            if contradictory:
+                report.defects.append(
+                    f"CONTRADICTORY LOSS DEFECT: sensor {exp_sensor} samples {contradictory[:5]} "
+                    f"were exported as valid data but also claimed in loss span [{exp_from}, {exp_to}]."
+                )
+
+        # Check unsupported mock loss (claims mock dropped data when mock did not drop it)
+        if exp_reason in ("buffer_overflow", "sensor_stall"):
+            is_supported = False
+            for gt_s, gt_from, gt_to, gt_r in target_gt_drops:
+                if gt_s == exp_sensor:
+                    # Check overlap between [exp_from, exp_to] and [gt_from, gt_to]
+                    exp_end = exp_to if exp_to is not None else exp_from
+                    if not (exp_end < gt_from or exp_from > gt_to):
+                        is_supported = True
+                        break
+
+            if not is_supported:
+                unsupported_loss_spans.add((exp_sensor, exp_from, exp_to))
+                count = (exp_to - exp_from + 1) if exp_to is not None else 1
+                report.unaccounted_loss_samples += count
+                report.defects.append(
+                    f"UNSUPPORTED LOSS DEFECT: Export claims mock loss [{exp_from}, {exp_to}] ({exp_reason}) "
+                    f"for sensor {exp_sensor}, but ground truth records no corresponding source drop."
+                )
+
+    # Step 5: Missing samples detection
     for key, gt_val in gt_samples.items():
         if key not in seen_export_keys:
             s, idx = key
-            covered_by_loss = False
-            for loss_sensor, l_from, l_to in exported_losses:
-                if loss_sensor == s:
+            covered_by_valid_loss = False
+            for loss_sensor, l_from, l_to, _ in exported_losses:
+                if loss_sensor == s and (loss_sensor, l_from, l_to) not in unsupported_loss_spans:
                     if l_to is None and idx >= l_from:
-                        covered_by_loss = True
+                        covered_by_valid_loss = True
                         break
                     elif l_to is not None and l_from <= idx <= l_to:
-                        covered_by_loss = True
+                        covered_by_valid_loss = True
                         break
 
-            if not covered_by_loss:
+            if not covered_by_valid_loss:
                 report.missing_samples += 1
                 report.defects.append(
-                    f"SILENT LOSS DEFECT: sensor {s} index {idx} missing without explicit loss ledger record."
+                    f"SILENT LOSS DEFECT: sensor {s} index {idx} missing without legitimate loss ledger record."
                 )
 
     return report
