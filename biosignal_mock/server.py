@@ -111,6 +111,17 @@ class MockServer:
                         self.generator.restart_session()
                         self.fault_config.trigger_restart = False
 
+                    # Apply fault injection: Selective Sensor Stall
+                    if self.fault_config.sensor_stall is not None:
+                        stall_sensor = self.fault_config.sensor_stall
+                        logger.info(f"Injecting sensor stall fault on sensor {stall_sensor}")
+                        self.generator.trigger_sensor_stall(
+                            sensor=stall_sensor,
+                            duration_sec=self.fault_config.sensor_stall_duration,
+                            samples=self.fault_config.sensor_stall_samples,
+                        )
+                        self.fault_config.sensor_stall = None
+
                     # Read sensor samples from generator ring buffer
                     first_index, data, lost, session_end = self.generator.read_sensor(
                         sensor=cmd.sensor,

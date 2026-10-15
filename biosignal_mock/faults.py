@@ -30,6 +30,7 @@ class FaultConfig:
     # Selective sensor suppression
     sensor_stall: Optional[int] = None
     sensor_stall_duration: float = 0.0
+    sensor_stall_samples: int = 0
     
     # Session restart simulation
     trigger_restart: bool = False

@@ -54,6 +54,9 @@ class DualSensorGenerator:
         self.buffer_s1 = SensorRingBuffer(sensor=1, capacity=buffer_capacity)
         self.buffer_s2 = SensorRingBuffer(sensor=2, capacity=buffer_capacity)
 
+        # Active sensor stalls: sensor_id -> (start_idx, end_idx)
+        self._stalls: dict[int, tuple[int, int]] = {}
+
     @staticmethod
     def _generate_session_id() -> str:
         """Generate a random 8-character lowercase hex session ID."""
@@ -65,6 +68,7 @@ class DualSensorGenerator:
         self.session_id = self._generate_session_id()
         self.current_index = 0
         self.is_session_ended = False
+        self._stalls.clear()
         self.buffer_s1 = SensorRingBuffer(sensor=1, capacity=self.buffer_capacity)
         self.buffer_s2 = SensorRingBuffer(sensor=2, capacity=self.buffer_capacity)
 
@@ -76,6 +80,41 @@ class DualSensorGenerator:
                 "timestamp": time.time(),
             })
         return self.session_id
+
+    def trigger_sensor_stall(
+        self,
+        sensor: int,
+        duration_sec: float = 0.0,
+        samples: int = 0,
+    ) -> tuple[int, int]:
+        """Trigger selective sensor stall (Section 6.3).
+        
+        The stalled sensor stops delivering data across [start_idx, end_idx],
+        reporting the span as lost, while the other sensor continues undisturbed.
+        """
+        if sensor not in (1, 2):
+            raise ValueError(f"Invalid sensor {sensor}; must be 1 or 2.")
+        stall_count = samples if samples > 0 else int(duration_sec * SAMPLING_RATE)
+        if stall_count <= 0:
+            return -1, -1
+
+        start_idx = self.current_index
+        end_idx = start_idx + stall_count - 1
+        self._stalls[sensor] = (start_idx, end_idx)
+
+        buf = self.buffer_s1 if sensor == 1 else self.buffer_s2
+        buf.inject_loss(from_index=start_idx, to_index=end_idx, reason="sensor_stall")
+
+        if self.ground_truth_tap:
+            self.ground_truth_tap({
+                "session_id": self.session_id,
+                "event": "sensor_stall",
+                "sensor": sensor,
+                "from_index": start_idx,
+                "to_index": end_idx,
+                "timestamp": time.time(),
+            })
+        return start_idx, end_idx
 
     def generate_single_step(self) -> tuple[list[int], list[int]]:
         """Advance generation by exactly one sample for both sensors."""
@@ -92,27 +131,48 @@ class DualSensorGenerator:
             s1_vals = self.signal_gen.generate_sensor1_sample(idx)
             s2_vals = self.signal_gen.generate_sensor2_sample(idx)
 
-        # Push into respective ring buffers
-        self.buffer_s1.push(idx, s1_vals)
-        self.buffer_s2.push(idx, s2_vals)
+        # Check selective sensor stall state
+        s1_stalled = False
+        if 1 in self._stalls:
+            s_from, s_to = self._stalls[1]
+            if s_from <= idx <= s_to:
+                s1_stalled = True
+            elif idx > s_to:
+                del self._stalls[1]
+
+        s2_stalled = False
+        if 2 in self._stalls:
+            s_from, s_to = self._stalls[2]
+            if s_from <= idx <= s_to:
+                s2_stalled = True
+            elif idx > s_to:
+                del self._stalls[2]
+
+        # Push into respective ring buffers only if not stalled
+        if not s1_stalled:
+            self.buffer_s1.push(idx, s1_vals)
+        if not s2_stalled:
+            self.buffer_s2.push(idx, s2_vals)
 
         # Emit to independent candidate ground-truth tap if configured
         if self.ground_truth_tap:
             now_ts = time.time()
-            self.ground_truth_tap({
-                "session_id": self.session_id,
-                "sensor": 1,
-                "index": idx,
-                "values": s1_vals,
-                "timestamp": now_ts,
-            })
-            self.ground_truth_tap({
-                "session_id": self.session_id,
-                "sensor": 2,
-                "index": idx,
-                "values": s2_vals,
-                "timestamp": now_ts,
-            })
+            if not s1_stalled:
+                self.ground_truth_tap({
+                    "session_id": self.session_id,
+                    "sensor": 1,
+                    "index": idx,
+                    "values": s1_vals,
+                    "timestamp": now_ts,
+                })
+            if not s2_stalled:
+                self.ground_truth_tap({
+                    "session_id": self.session_id,
+                    "sensor": 2,
+                    "index": idx,
+                    "values": s2_vals,
+                    "timestamp": now_ts,
+                })
 
         self.current_index += 1
         if self.current_index >= self.max_total_samples:

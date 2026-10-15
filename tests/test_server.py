@@ -195,3 +195,74 @@ async def test_server_restart_fault_injection() -> None:
         await writer.wait_closed()
     finally:
         await server.stop()
+
+
+@pytest.mark.asyncio
+async def test_server_selective_sensor_stall_fault_injection() -> None:
+    """Verifies AUDIT-03 / REQ-A-12: selective sensor stall suppresses one sensor while other continues."""
+    port = 7199
+    server = MockServer(
+        mode="ramp",
+        port=port,
+        host="127.0.0.1",
+        realtime=False,
+    )
+    server.generator.advance_samples(50)
+    await server.start()
+    try:
+        reader, writer = await asyncio.open_connection("127.0.0.1", port)
+
+        # 1. Initial reads for both sensors
+        writer.write(ReadCommand(sensor=1).to_json().encode("utf-8"))
+        await writer.drain()
+        reply1, _ = parse_mock_reply(await reader.readline())
+        assert reply1.first_index == 0
+        assert reply1.count == 50
+        assert len(reply1.lost) == 0
+
+        writer.write(ReadCommand(sensor=2).to_json().encode("utf-8"))
+        await writer.drain()
+        reply2, _ = parse_mock_reply(await reader.readline())
+        assert reply2.first_index == 0
+        assert reply2.count == 50
+        assert len(reply2.lost) == 0
+
+        # 2. Trigger selective stall on Sensor 1 for 100 samples (indices 50 to 149)
+        server.fault_config.sensor_stall = 1
+        server.fault_config.sensor_stall_samples = 100
+
+        # Trigger stall processing on next command
+        writer.write(ReadCommand(sensor=1).to_json().encode("utf-8"))
+        await writer.drain()
+        reply_stall_immediate, _ = parse_mock_reply(await reader.readline())
+        assert len(reply_stall_immediate.lost) == 1
+        assert reply_stall_immediate.lost[0].from_index == 50
+        assert reply_stall_immediate.lost[0].to_index == 149
+        assert reply_stall_immediate.lost[0].reason == "sensor_stall"
+
+        # 3. Advance generator by 100 samples (while S1 is stalled, S2 generates normally)
+        server.generator.advance_samples(100)
+
+        # 4. Advance generator by 50 more samples (S1 resumes at 150, S2 continues at 150)
+        server.generator.advance_samples(50)
+
+        # 5. Sensor 2 must have all samples 50..199 (150 samples) with ZERO loss
+        writer.write(ReadCommand(sensor=2).to_json().encode("utf-8"))
+        await writer.drain()
+        reply_s2_after, _ = parse_mock_reply(await reader.readline())
+        assert reply_s2_after.first_index == 50
+        assert reply_s2_after.count == 150
+        assert len(reply_s2_after.lost) == 0
+
+        # 6. Sensor 1 resumes from index 150 with 50 samples
+        writer.write(ReadCommand(sensor=1).to_json().encode("utf-8"))
+        await writer.drain()
+        reply_s1_after, _ = parse_mock_reply(await reader.readline())
+        assert reply_s1_after.first_index == 150
+        assert reply_s1_after.count == 50
+        assert len(reply_s1_after.lost) == 0
+
+        writer.close()
+        await writer.wait_closed()
+    finally:
+        await server.stop()
