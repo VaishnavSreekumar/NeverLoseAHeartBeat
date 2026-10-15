@@ -10,7 +10,7 @@ Verifies REQ-A-07, REQ-A-08, REQ-A-09, REQ-A-10, REQ-A-12:
 import asyncio
 import pytest
 from biosignal_mock.faults import FaultConfig
-from biosignal_mock.server import MockServer
+from biosignal_mock.server import MockServer, compute_deadline_delay
 from shared.protocol import ReadCommand, parse_mock_reply
 
 TEST_PORT = 7188  # Dynamic port for test isolation
@@ -266,3 +266,59 @@ async def test_server_selective_sensor_stall_fault_injection() -> None:
         await writer.wait_closed()
     finally:
         await server.stop()
+
+
+def test_deterministic_deadline_scheduler_anti_drift() -> None:
+    """Verifies AUDIT-06: absolute deadline scheduler compensates for sleep jitter and prevents drift."""
+    batch_interval = 0.025  # 25 ms per batch
+    start_time = 1000.0
+
+    # Iteration 1: started at 1000.0, evaluated at 1000.001
+    d1 = compute_deadline_delay(start_time, batches_generated=1, batch_interval=batch_interval, now=1000.001)
+    # Expected target is 1000.025 -> delay is 0.024
+    assert pytest.approx(d1, abs=1e-6) == 0.024
+
+    # Suppose sleep overshot by 5 ms, so now is 1000.030
+    # Iteration 2 target is 1000.050.
+    d2 = compute_deadline_delay(start_time, batches_generated=2, batch_interval=batch_interval, now=1000.030)
+    # Delay must automatically decrease to 0.020 to recover the 5 ms overshoot!
+    assert pytest.approx(d2, abs=1e-6) == 0.020
+
+    # Suppose iteration 2 also overshot slightly, waking at 1000.052 (2 ms lag)
+    # Iteration 3 target is 1000.075.
+    d3 = compute_deadline_delay(start_time, batches_generated=3, batch_interval=batch_interval, now=1000.052)
+    # Delay must adjust to 0.023 to recover the 2 ms overshoot
+    assert pytest.approx(d3, abs=1e-6) == 0.023
+
+
+@pytest.mark.asyncio
+async def test_server_realtime_sampling_rate_integration() -> None:
+    """Verifies AUDIT-06: real-time generation loop runs with deadline compensation without major drift.
+    
+    Note: Tests sustained rate over wall-clock window without asserting hard real-time guarantees,
+    as standard desktop OS schedulers have 1-15 ms timer resolution.
+    """
+    port = 7198
+    server = MockServer(
+        mode="ramp",
+        port=port,
+        host="127.0.0.1",
+        realtime=True,
+    )
+    t0 = asyncio.get_running_loop().time()
+    await server.start()
+    try:
+        # Run for 0.4 seconds (scheduled for 16 batches = 160 samples at 400 Hz)
+        await asyncio.sleep(0.40)
+        elapsed = asyncio.get_running_loop().time() - t0
+        samples_produced = server.generator.current_index
+        
+        # Calculate effective rate
+        rate = samples_produced / elapsed
+        # On a desktop OS, rate should be within practical bound (300 Hz to 500 Hz)
+        # and definitely should have generated significant samples (>120 samples)
+        assert samples_produced >= 120
+        assert 300.0 <= rate <= 500.0
+    finally:
+        await server.stop()
+

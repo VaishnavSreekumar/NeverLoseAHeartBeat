@@ -24,6 +24,17 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(me
 logger = logging.getLogger("biosignal_mock")
 
 
+def compute_deadline_delay(
+    start_time: float,
+    batches_generated: int,
+    batch_interval: float,
+    now: float,
+) -> float:
+    """Compute sleep duration anchored to absolute schedule to prevent drift accumulation."""
+    target_time = start_time + (batches_generated * batch_interval)
+    return target_time - now
+
+
 class MockServer:
     """TCP server serving biosignal mock data over NDJSON."""
 
@@ -56,17 +67,25 @@ class MockServer:
         self._stop_event = asyncio.Event()
 
     async def _generation_loop(self) -> None:
-        """Continuously generate samples at 400 Hz into ring buffers."""
+        """Continuously generate samples at 400 Hz into ring buffers with absolute deadline scheduling."""
         batch_size = 10  # Emit 10 samples every 25ms (400 samples/sec)
         batch_interval = batch_size / SAMPLING_RATE  # 0.025s = 25ms
+        loop = asyncio.get_running_loop()
+        start_time = loop.time()
+        batches_generated = 0
         
         try:
             while not self._stop_event.is_set() and not self.generator.is_session_ended:
-                t0 = asyncio.get_running_loop().time()
                 self.generator.advance_samples(batch_size)
-                elapsed = asyncio.get_running_loop().time() - t0
-                sleep_duration = max(0.0, batch_interval - elapsed)
-                await asyncio.sleep(sleep_duration)
+                batches_generated += 1
+                
+                # Absolute deadline calculation anchored to session timeline
+                delay = compute_deadline_delay(start_time, batches_generated, batch_interval, loop.time())
+                if delay > 0:
+                    await asyncio.sleep(delay)
+                elif delay < -1.0:
+                    # Severe lag fallback: re-anchor to prevent runaway burst loop
+                    start_time = loop.time() - (batches_generated * batch_interval)
         except asyncio.CancelledError:
             pass
 
