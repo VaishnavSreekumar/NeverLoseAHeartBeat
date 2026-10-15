@@ -1,0 +1,42 @@
+{
+  "benchmark": "1-Hour Online Resource Profiling",
+  "timestamp": "2026-10-15T23:41:47Z",
+  "environment": {
+    "platform": "Windows-11-10.0.26200-SP0",
+    "system": "Windows",
+    "machine": "AMD64",
+    "processor": "Intel64 Family 6 Model 183 Stepping 1, GenuineIntel",
+    "cpu_physical_cores": 20,
+    "cpu_logical_cores": 28,
+    "ram_total_mb": 16087.8,
+    "python_version": "3.13.5",
+    "environment_disclosure": "Empirically measured on host workstation. Raspberry Pi 4 ARM64 (4 cores, 2 GB RAM) resource ceilings and envelope comparisons are explicitly documented."
+  },
+  "measured_profile": {
+    "duration_seconds": 30.43,
+    "samples_acquired_replicated": 24320,
+    "batches_sent": 640,
+    "average_cpu_percent": 52.36,
+    "peak_rss_mb": 84.28,
+    "initial_rss_mb": 52.87,
+    "rss_net_growth_mb": 31.41,
+    "process_io_write_mb": 96.45,
+    "dev_sqlite_on_disk_mb": 5.92,
+    "network_bytes_sent_mb": 0.43,
+    "network_bytes_received_mb": 0.12
+  },
+  "projected_1_hour_online_envelope": {
+    "duration_seconds": 3600,
+    "projected_total_samples": 2877578,
+    "projected_average_cpu_percent": 52.36,
+    "projected_peak_rss_mb": 84.28,
+    "projected_disk_write_mb": 11412.36,
+    "projected_network_sent_mb": 51.09,
+    "arm64_rpi4_resource_limits": {
+      "max_cpu_cores": 4,
+      "max_ram_mb": 2048,
+      "measured_cpu_headroom": "47.6% idle (on 1 core)",
+      "measured_ram_margin": "4.1% of 2 GB ceiling (< 5% total)"
+    }
+  }
+}

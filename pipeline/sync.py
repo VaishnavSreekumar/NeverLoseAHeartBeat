@@ -39,6 +39,8 @@ class SyncTelemetry:
     conflicts_encountered: int = 0
     network_errors: int = 0
     transition_count: int = 0
+    bytes_sent: int = 0
+    bytes_received: int = 0
     last_sync_time: float = 0.0
     last_successful_contact: float = 0.0
 
@@ -197,10 +199,14 @@ class CloudSyncWorker:
             )
 
             # Update telemetry
+            req_content = getattr(resp.request, "content", b"") or b""
+            resp_content = getattr(resp, "content", b"") or b""
             with self._lock:
                 self.telemetry.batches_sent += 1
                 self.telemetry.samples_replicated += data.get("samples_inserted", 0)
                 self.telemetry.duplicates_reported += data.get("duplicates_ignored", 0)
+                self.telemetry.bytes_sent += len(req_content)
+                self.telemetry.bytes_received += len(resp_content)
                 if batch.lost:
                     self.telemetry.loss_records_replicated += len(batch.lost)
 
