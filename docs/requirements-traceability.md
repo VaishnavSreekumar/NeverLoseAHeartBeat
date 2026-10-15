@@ -18,7 +18,16 @@ Each requirement is assigned a deterministic identifier following the schema `RE
 - **Acceptance Condition:** Exact measurable condition for verification sign-off.
 - **Status:** Unverified (Phase 0 baseline).
 
+### Sample Lifecycle Classification
+All components and tests adhere to 5 strict mutually exclusive sample lifecycle states:
+1. `GENERATED`: Emitted by mock generator, buffered in mock memory.
+2. `RECEIVED`: Decoded from NDJSON and CRC-validated in device process memory. Volatile; not yet safe.
+3. `COMMITTED`: Persisted to local SQLite WAL file with completed `fsync()`. Guaranteed durable within 0.5s power-loss bound.
+4. `CLOUD_ACKNOWLEDGED`: Persisted in cloud DB and explicitly acknowledged to device with confirmed index range.
+5. `KNOWN_MISSING`: Verified dropped range permanently logged in `loss_ledger` with auditable reason.
+
 ---
+
 
 ## Category A: Mock Service Protocol & Deterministic Data Generation
 

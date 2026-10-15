@@ -256,3 +256,49 @@ flowchart TD
   2. The mock terminates unexpectedly or restarts with a new session ID (`to_index: null`).
   3. Re-read retries exceed limit or the 10-second ring buffer expires.
 - **Resulting Invariant:** At the time of session completion or export, every sample index in the span $[0, \max(\text{index})]$ is either stored in `samples` or accounted for in `loss_ledger`. Zero silent gaps are permitted.
+
+### 4.3 Sample Lifecycle States & Durability Semantics
+
+To prevent ambiguous states and ensure strict engineering rigor, the pipeline defines five mutually exclusive states for every sample:
+
+```mermaid
+stateDiagram-v2
+    [*] --> GENERATED: Mock Service Generator
+    GENERATED --> RECEIVED: TCP Frame Decoded & CRC-32 Verified
+    GENERATED --> KNOWN_MISSING: Mock Buffer Drops (>10s) or Stall
+    
+    RECEIVED --> DURABLY_COMMITTED: SQLite WAL Batch Commit + fsync
+    RECEIVED --> UNCERTAIN_LOST: Sudden Crash/Power Cut before fsync
+    UNCERTAIN_LOST --> KNOWN_MISSING: Startup Recovery Scan Logs Gap
+    
+    DURABLY_COMMITTED --> CLOUD_ACKNOWLEDGED: HTTP 200 + Index Confirmation
+    DURABLY_COMMITTED --> DURABLY_COMMITTED: HTTP Failure / Retry Loop
+```
+
+1. **State: GENERATED**
+   - **Location:** Inside `biosignal-mock` internal ring buffer.
+   - **Semantics:** Sample exists mathematically in memory. If not read within 10 seconds, it transitions directly to `KNOWN_MISSING` via the mock's `lost` payload.
+2. **State: RECEIVED (Volatile In-Memory)**
+   - **Location:** TCP buffer or `asyncio.Queue` in pipeline memory.
+   - **Semantics:** Frame received, NDJSON parsed, CRC-32 verified. **CRITICAL:** A sample in `RECEIVED` state is NOT yet safe. A process kill or power cut will destroy it. It must NEVER be reported as saved or acknowledged.
+3. **State: DURABLY COMMITTED (Local Disk)**
+   - **Location:** SQLite database file on physical storage (`PRAGMA journal_mode = WAL;`, `fsync()` completed).
+   - **Semantics:** The transaction batch has committed and the kernel has flushed bytes to non-volatile media. It will survive process kill (`SIGKILL`), reboot, and physical power loss within the guaranteed 0.5s bound.
+4. **State: CLOUD ACKNOWLEDGED (Remote Persistent Store)**
+   - **Location:** Cloud PostgreSQL / LibSQL database.
+   - **Semantics:** An HTTP write is NOT considered safe upon socket write or HTTP return code alone. The cloud endpoint returns an explicit JSON payload confirming `{"acknowledged_up_to": {"1": idx1, "2": idx2}}` after durable commit in the cloud database. Only upon parsing this acknowledgment does the device advance its `cloud_synced_checkpoint`.
+5. **State: KNOWN MISSING (Loss Ledger)**
+   - **Location:** `loss_ledger` table on disk and cloud.
+   - **Semantics:** Confirmed dropped indices recorded with exact metadata (`sensor`, `from_index`, `to_index`, `reason`). Gaps are never interpolated or filled with synthetic values.
+
+---
+
+## 5. Engineering Boundaries & Scope Discipline
+
+1. **Simplest Viable Architecture:**
+   - Every dependency is justified: standard Python 3.13 standard library (`asyncio`, `sqlite3`, `socket`, `zlib`) for edge acquisition; FastAPI + Uvicorn for standard HTTP ingestion; pytest for testing. No unnecessary message brokers, no heavyweight ORMs, no external C libraries.
+2. **Clinical Interpretation Disclaimer:**
+   - The synthetic ECG and PPG signals generated in `--mode signal` are strictly for software systems verification (heart rate peak detection, frequency tracking, stress testing). They are not intended for clinical diagnosis, patient monitoring, or medical device certification.
+3. **Transparency of Uncertain States:**
+   - When a session restarts or an unannounced crash occurs, the exact end of missing data may be unknown. The pipeline records `to_index: null` rather than guessing the boundary.
+
