@@ -223,16 +223,18 @@ async def test_client_duplicate_reply_handling() -> None:
     try:
         await client.connect()
 
-        # Poll sensor 1
+        # Poll 1: queries S1 -> receives S1 frame (buffered duplicate S1 frame remains in socket)
         await client.poll_once()
-        assert client.accepted_queue.qsize() >= 1
+        assert client.accepted_queue.qsize() == 1
 
-        # Poll sensor 2
+        # Poll 2: queries S2 -> reads the buffered duplicate S1 frame from socket, detects duplicate, discards it
         await client.poll_once()
-        assert client.accepted_queue.qsize() >= 2
+        assert client.telemetry.duplicate_frames_handled >= 1
 
-        # Verify duplicate frames handled counter or queue accumulation
-        assert client.telemetry.batches_accepted >= 2
+        # Poll 3: reads the S2 frame produced by query 2
+        await client.poll_once()
+        assert client.accepted_queue.qsize() == 2
+        assert client.telemetry.batches_accepted == 2
     finally:
         await client.disconnect()
         await server.stop()

@@ -13,6 +13,7 @@ Responsible for:
 from __future__ import annotations
 
 import asyncio
+from collections import deque
 import logging
 import time
 from dataclasses import dataclass, field
@@ -27,6 +28,12 @@ from shared.protocol import (
 )
 
 logger = logging.getLogger("pipeline.protocol_client")
+
+
+class IntegrityConflictError(RuntimeError):
+    """Raised when an incoming sample or reply has identical (session_id, sensor, sample_index)
+    but conflicting channel values."""
+    pass
 
 
 @dataclass(frozen=True)
@@ -105,6 +112,21 @@ class BiosignalProtocolClient:
         poll_delay: float = 0.01,
         recovery_cursor_provider: Optional[Callable[[str, int], int]] = None,
     ) -> None:
+        """Initialize the protocol client.
+        
+        Args:
+            host: IP address or hostname of mock server.
+            port: TCP port of mock server.
+            read_timeout: Bounded socket read timeout in seconds.
+            max_crc_retries: Number of targeted re-read attempts after an initial CRC failure
+                (1 initial attempt + max_crc_retries re-reads = 1 + max_crc_retries total reads).
+            reconnect_delay: Initial reconnect backoff delay in seconds.
+            max_reconnect_delay: Maximum reconnect backoff delay cap.
+            queue_maxsize: Maximum number of accepted IngestBatch items in downstream queue.
+            sweeper_interval: Seconds between in-process gap reconciliation sweeps.
+            poll_delay: Delay between poll steps.
+            recovery_cursor_provider: Optional callback providing persisted recovery cursor.
+        """
         self.host = host
         self.port = port
         self.read_timeout = read_timeout
@@ -123,6 +145,12 @@ class BiosignalProtocolClient:
 
         # Transport wire polling cursor (ephemeral, distinct from storage recovery cursor)
         self.transport_polling_cursor: dict[int, int] = {1: 0, 2: 0}
+
+        # Bounded cache of recent samples for duplicate integrity validation:
+        # Key: (session_id, sensor, sample_index) -> Value: list[int] channel values
+        self._recent_samples: dict[tuple[str, int, int], list[int]] = {}
+        self._recent_sample_keys: deque[tuple[str, int, int]] = deque()
+        self._max_recent_samples: int = 10000
 
         self.current_session_id: Optional[str] = None
         self.active_sensor: int = 1
@@ -205,6 +233,11 @@ class BiosignalProtocolClient:
             logger.warning(f"Read timed out after {self.read_timeout}s waiting for reply.")
             self.telemetry.read_timeouts += 1
             return None
+        except ValueError as exc:
+            logger.error(f"Frame line exceeded buffer limit (framing violation): {exc}")
+            self.telemetry.protocol_errors += 1
+            self._connected = False
+            return None
         except (OSError, ConnectionResetError, BrokenPipeError) as exc:
             logger.warning(f"Socket error reading reply: {exc}")
             self._connected = False
@@ -229,10 +262,55 @@ class BiosignalProtocolClient:
             self.transport_polling_cursor[2] = 0
             # Quarantined incidents from previous session are cleared from memory
             self.unresolved_crc_incidents.clear()
+            # Clear recent sample cache for new session
+            self._recent_samples.clear()
+            self._recent_sample_keys.clear()
 
     async def _enqueue_validated_reply(self, reply: MockReply) -> None:
-        """Wrap and enqueue a verified reply into the accepted batch queue."""
+        """Wrap and enqueue a verified reply into the accepted batch queue.
+        
+        Validates duplicate integrity:
+        - Identical duplicates are safely ignored with duplicate telemetry incremented.
+        - Conflicting duplicates (same index, different channel values) raise IntegrityConflictError.
+        """
         self._handle_session_transition(reply.session_id)
+
+        # Check for sample-level duplicate conflicts
+        all_duplicate = True if (reply.data or not reply.lost) else False
+        new_samples_to_record: list[tuple[tuple[str, int, int], list[int]]] = []
+
+        for offset, sample_vals in enumerate(reply.data):
+            idx = reply.first_index + offset
+            key = (reply.session_id, reply.sensor, idx)
+            if key in self._recent_samples:
+                existing_vals = self._recent_samples[key]
+                if existing_vals != sample_vals:
+                    msg = (
+                        f"Integrity conflict on session {reply.session_id}, sensor {reply.sensor}, "
+                        f"index {idx}: existing values {existing_vals} != incoming values {sample_vals}"
+                    )
+                    logger.error(msg)
+                    raise IntegrityConflictError(msg)
+            else:
+                all_duplicate = False
+                new_samples_to_record.append((key, sample_vals))
+
+        if reply.data and all_duplicate and not reply.lost:
+            # Completely redundant identical duplicate frame
+            logger.info(
+                f"Identical duplicate reply frame safely discarded for sensor {reply.sensor}, "
+                f"first_index={reply.first_index}, count={reply.count}."
+            )
+            self.telemetry.duplicate_frames_handled += 1
+            return
+
+        # Record new sample values in bounded recent cache
+        for key, vals in new_samples_to_record:
+            self._recent_samples[key] = vals
+            self._recent_sample_keys.append(key)
+            if len(self._recent_sample_keys) > self._max_recent_samples:
+                old_key = self._recent_sample_keys.popleft()
+                self._recent_samples.pop(old_key, None)
 
         # Update transport wire cursor to reflect received samples
         next_idx = reply.first_index + reply.count
@@ -294,6 +372,16 @@ class BiosignalProtocolClient:
             retry_reply, is_valid = await self._query_and_validate(retry_cmd)
 
             if is_valid and retry_reply is not None:
+                # If during retries the session changed, handle session transition cleanly
+                if self.current_session_id is not None and retry_reply.session_id != self.current_session_id:
+                    logger.info(
+                        f"Session transition detected during CRC retry: {self.current_session_id} -> {retry_reply.session_id}."
+                    )
+                    self._handle_session_transition(retry_reply.session_id)
+                    await self._enqueue_validated_reply(retry_reply)
+                    recovered = True
+                    break
+
                 logger.info(
                     f"Targeted re-read succeeded on attempt {retry_idx} for sensor {sensor} "
                     f"at index {requested_index}"
@@ -311,8 +399,9 @@ class BiosignalProtocolClient:
                 to_idx = failed_reply.first_index + failed_reply.count - 1
                 span_count = failed_reply.count or 100
 
+            incident_session = self.current_session_id or (failed_reply.session_id if failed_reply and failed_reply.session_id else "unknown")
             incident = UnresolvedCrcIncident(
-                session_id=self.current_session_id or "unknown",
+                session_id=incident_session,
                 sensor=sensor,
                 from_index=requested_index,
                 to_index=to_idx,
@@ -334,6 +423,16 @@ class BiosignalProtocolClient:
             return
 
         incident = self.unresolved_crc_incidents[0]
+
+        # Guard: If incident belongs to an old session, it cannot be recovered by the current session.
+        if self.current_session_id is not None and incident.session_id != self.current_session_id:
+            logger.info(
+                f"Discarding quarantined incident from prior session {incident.session_id} "
+                f"(current session is {self.current_session_id})."
+            )
+            self.unresolved_crc_incidents.pop(0)
+            return
+
         logger.debug(
             f"In-process sweeper re-polling unresolved gap for sensor {incident.sensor} "
             f"from_index={incident.from_index}"
@@ -342,8 +441,28 @@ class BiosignalProtocolClient:
         reply, is_valid = await self._query_and_validate(sweep_cmd)
 
         if is_valid and reply is not None:
+            # Check for session transition detected during sweep
+            if self.current_session_id is not None and reply.session_id != self.current_session_id:
+                logger.info(
+                    f"Session transition detected during sweep: {self.current_session_id} -> {reply.session_id}. "
+                    "Preserving terminal uncertainty for previous session."
+                )
+                self._handle_session_transition(reply.session_id)
+                await self._enqueue_validated_reply(reply)
+                return
+
+            if reply.session_id != incident.session_id:
+                # Reply is from a different session than the incident
+                logger.warning(
+                    f"Reply session {reply.session_id} does not match incident session {incident.session_id}. "
+                    "Cannot attribute new session data to old incident."
+                )
+                self._handle_session_transition(reply.session_id)
+                await self._enqueue_validated_reply(reply)
+                return
+
             # Check if reply actually covered the missing index
-            if reply.first_index <= incident.from_index:
+            if reply.first_index <= incident.from_index and (reply.first_index + reply.count) > incident.from_index:
                 logger.info(
                     f"In-process gap sweeper successfully recovered gap for sensor {incident.sensor} "
                     f"from_index={incident.from_index}!"
@@ -355,7 +474,7 @@ class BiosignalProtocolClient:
             elif reply.lost:
                 # Mock returned explicit loss record (e.g. buffer_overflow evicted older data)
                 for loss in reply.lost:
-                    if loss.from_index <= incident.from_index:
+                    if loss.from_index <= incident.from_index and (loss.to_index is None or loss.to_index >= incident.from_index):
                         logger.info(
                             f"Mock authoritatively reported loss for quarantined gap: {loss.reason}. "
                             "Transitioning incident to confirmed loss via accepted batch."
@@ -401,13 +520,12 @@ class BiosignalProtocolClient:
         # Valid reply received
         assert reply is not None
 
-        # Check if reply matches requested sensor or is a duplicate buffered frame
+        # Check if reply matches requested sensor or is a pipelined frame
         if reply.sensor != sensor:
             logger.info(
                 f"Received frame for sensor {reply.sensor} while querying sensor {sensor} "
-                "(duplicate/pipelined frame). Handled cleanly."
+                "(pipelined frame). Handled cleanly."
             )
-            self.telemetry.duplicate_frames_handled += 1
 
         await self._enqueue_validated_reply(reply)
 
