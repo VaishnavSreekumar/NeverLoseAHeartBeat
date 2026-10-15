@@ -145,38 +145,118 @@ def extract_raw_data_slice(raw_line: str) -> str:
     """Extract the raw substring of the 'data' array from '[' to matching ']'.
     
     Preserves exact whitespace and character representation as sent over the wire.
+    Uses token-level scanning to avoid false matches on '"data"' inside preceding
+    string values or metadata fields.
     """
-    key_pos = raw_line.find('"data"')
-    if key_pos == -1:
+    n = len(raw_line)
+    i = 0
+    in_string = False
+    escape = False
+    brace_depth = 0
+    bracket_depth = 0
+    
+    data_start_bracket = -1
+    
+    while i < n:
+        c = raw_line[i]
+        
+        if escape:
+            escape = False
+            i += 1
+            continue
+            
+        if c == '\\':
+            if in_string:
+                escape = True
+            i += 1
+            continue
+            
+        if c == '"':
+            if not in_string:
+                # Starting a string literal.
+                # Check if this string could be the key "data" at top-level object (brace_depth == 1, bracket_depth == 0)
+                str_start = i
+                j = i + 1
+                str_escaped = False
+                while j < n:
+                    cj = raw_line[j]
+                    if str_escaped:
+                        str_escaped = False
+                        j += 1
+                        continue
+                    if cj == '\\':
+                        str_escaped = True
+                        j += 1
+                        continue
+                    if cj == '"':
+                        break
+                    j += 1
+                
+                if j >= n:
+                    raise ProtocolError("Unterminated string literal in JSON line.")
+                
+                content = raw_line[str_start + 1 : j]
+                
+                # Check if this string is the property key "data"
+                if brace_depth == 1 and bracket_depth == 0 and content == "data":
+                    # Look ahead after closing quote for optional whitespace, then ':'
+                    k = j + 1
+                    while k < n and raw_line[k].isspace():
+                        k += 1
+                    if k < n and raw_line[k] == ':':
+                        k += 1
+                        while k < n and raw_line[k].isspace():
+                            k += 1
+                        if k < n and raw_line[k] == '[':
+                            data_start_bracket = k
+                            break
+                        else:
+                            raise ProtocolError("Value for 'data' key must be an array starting with '['.")
+                
+                # If not the "data" key or value not bracket, advance past this string
+                i = j + 1
+                continue
+            else:
+                in_string = False
+                i += 1
+                continue
+                
+        if not in_string:
+            if c == '{':
+                brace_depth += 1
+            elif c == '}':
+                brace_depth -= 1
+            elif c == '[':
+                bracket_depth += 1
+            elif c == ']':
+                bracket_depth -= 1
+                
+        i += 1
+        
+    if data_start_bracket == -1:
         raise ProtocolError("Missing '\"data\"' key in payload line.")
-    
-    colon_pos = raw_line.find(':', key_pos)
-    if colon_pos == -1:
-        raise ProtocolError("Missing colon after '\"data\"' key.")
-    
-    start_bracket = raw_line.find('[', colon_pos)
-    if start_bracket == -1:
-        raise ProtocolError("Missing opening '[' for 'data' array.")
-    
+        
+    # Now find the matching ']' for data_start_bracket
     depth = 0
     in_string = False
     escape = False
     end_bracket = -1
     
-    for idx in range(start_bracket, len(raw_line)):
+    for idx in range(data_start_bracket, n):
         char = raw_line[idx]
         if escape:
             escape = False
             continue
         if char == '\\':
-            escape = True
+            if in_string:
+                escape = True
             continue
         if char == '"':
             in_string = not in_string
             continue
         if in_string:
             continue
-        
+            
         if char == '[':
             depth += 1
         elif char == ']':
@@ -187,8 +267,8 @@ def extract_raw_data_slice(raw_line: str) -> str:
                 
     if end_bracket == -1 or depth != 0:
         raise ProtocolError("Unmatched brackets in 'data' array payload.")
-    
-    return raw_line[start_bracket : end_bracket + 1]
+        
+    return raw_line[data_start_bracket : end_bracket + 1]
 
 
 def format_mock_reply(

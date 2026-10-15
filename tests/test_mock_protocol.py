@@ -61,15 +61,15 @@ def test_read_command_validation_failures() -> None:
 
 
 def test_crc32_computation_and_spec_vector() -> None:
-    """Verifies REQ-A-10: zlib CRC-32 computed over data text."""
+    """Verifies REQ-A-10 & AUDIT-07: zlib CRC-32 computed over data text matches exact spec vector."""
     # Data text matching spec line 311:
     # "data": [[720, 1200, 1560], [708, 1180, 1534], [726, 1210, 1573]]
     spec_data_text = "[[720, 1200, 1560], [708, 1180, 1534], [726, 1210, 1573]]"
     crc = compute_crc32(spec_data_text)
     assert len(crc) == 8
     assert crc.islower()
-    # Check that it produces consistent deterministic hex
-    assert crc == compute_crc32(spec_data_text)
+    # Literal test vector from raw_assessment_spec.txt line 311
+    assert crc == "f9a5bf62"
 
 
 def test_extract_raw_data_slice() -> None:
@@ -81,12 +81,47 @@ def test_extract_raw_data_slice() -> None:
     )
     raw_slice = extract_raw_data_slice(wire_line)
     assert raw_slice == "[[720, 1200, 1560], [708, 1180, 1534], [726, 1210, 1573]]"
+    assert compute_crc32(raw_slice) == "f9a5bf62"
 
     # Malformed lines
     with pytest.raises(ProtocolError):
         extract_raw_data_slice('{"no_data_key": 1}')
     with pytest.raises(ProtocolError):
         extract_raw_data_slice('{"data": [1, 2')  # Unmatched
+
+
+def test_extract_raw_data_slice_adversarial_cases() -> None:
+    """Verifies AUDIT-05: parser handles tricky metadata, escaped quotes, and whitespace without false match."""
+    # Case 1: Preceding string containing "data": [fake] with escaped quote
+    line1 = '{"session_id": "data\\": [fake]", "sensor": 1, "data": [[1, 2, 3]]}'
+    assert extract_raw_data_slice(line1) == "[[1, 2, 3]]"
+
+    # Case 2: Preceding metadata object with nested array and key mentioning data
+    line2 = '{"lost": [{"reason": "data: [overflow]"}], "data": [[720, 1200, 1560]]}'
+    assert extract_raw_data_slice(line2) == "[[720, 1200, 1560]]"
+
+    # Case 3: Whitespace between key, colon, and opening bracket
+    line3 = '{"notes": "some text",   "data"   :   \n  [[10, 20, 30]]   }'
+    assert extract_raw_data_slice(line3) == "[[10, 20, 30]]"
+
+    # Case 4: Deeply nested data array
+    line4 = '{"sensor": 1, "data": [[[1, 2], [3, 4]], [[5, 6], [7, 8]]]}'
+    assert extract_raw_data_slice(line4) == "[[[1, 2], [3, 4]], [[5, 6], [7, 8]]]"
+
+    # Case 5: Data key with non-array value raises ProtocolError
+    with pytest.raises(ProtocolError):
+        extract_raw_data_slice('{"data": "not an array"}')
+
+    # Case 6: Full parse_mock_reply succeeds with adversarial preceding keys
+    line_full = (
+        '{"session_id": "data\\": [fake]", "sensor": 1, "first_index": 0, "count": 1, '
+        '"lost": [{"from_index": 0, "to_index": 1, "reason": "data"}], "session_end": false, '
+        f'"crc32": "{compute_crc32("[[1, 2, 3]]")}", '
+        '"data": [[1, 2, 3]]}\n'
+    )
+    reply, is_valid = parse_mock_reply(line_full)
+    assert is_valid is True
+    assert reply.raw_data_text == "[[1, 2, 3]]"
 
 
 def test_format_and_parse_mock_reply_success() -> None:
