@@ -170,6 +170,7 @@ class BiosignalProtocolClient:
         self._connected = False
         self._running = False
         self._stop_event = asyncio.Event()
+        self.storage_error_event: asyncio.Event = asyncio.Event()
         self._main_task: Optional[asyncio.Task[None]] = None
         self._last_sweeper_time: float = 0.0
 
@@ -257,6 +258,14 @@ class BiosignalProtocolClient:
         if self.current_session_id is None:
             self.current_session_id = new_session_id
             logger.info(f"Initial session established: {new_session_id}")
+            # If a recovery cursor provider exists, check if this session has a committed recovery checkpoint
+            if self.recovery_cursor_provider:
+                s1_rec = self.recovery_cursor_provider(new_session_id, 1)
+                if s1_rec >= 0:
+                    self.transport_polling_cursor[1] = s1_rec + 1
+                s2_rec = self.recovery_cursor_provider(new_session_id, 2)
+                if s2_rec >= 0:
+                    self.transport_polling_cursor[2] = s2_rec + 1
             return
 
         if new_session_id != self.current_session_id:
@@ -273,9 +282,16 @@ class BiosignalProtocolClient:
             self.unresolved_crc_incidents.clear()
 
             self.current_session_id = new_session_id
-            # Reset wire transport cursors for new session
-            self.transport_polling_cursor[1] = 0
-            self.transport_polling_cursor[2] = 0
+            # Reset wire transport cursors for new session or initialize from recovery provider
+            if self.recovery_cursor_provider:
+                s1_rec = self.recovery_cursor_provider(new_session_id, 1)
+                self.transport_polling_cursor[1] = s1_rec + 1 if s1_rec >= 0 else 0
+                s2_rec = self.recovery_cursor_provider(new_session_id, 2)
+                self.transport_polling_cursor[2] = s2_rec + 1 if s2_rec >= 0 else 0
+            else:
+                self.transport_polling_cursor[1] = 0
+                self.transport_polling_cursor[2] = 0
+
             # Clear recent sample cache for new session
             self._recent_samples.clear()
             self._recent_sample_keys.clear()
@@ -504,7 +520,7 @@ class BiosignalProtocolClient:
 
     async def poll_once(self) -> None:
         """Execute a single interleaved polling step for the active sensor."""
-        if not self.is_connected:
+        if not self.is_connected or self.storage_error_event.is_set():
             return
 
         now = time.monotonic()
