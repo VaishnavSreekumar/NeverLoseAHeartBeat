@@ -41,6 +41,7 @@ htmlcov/
 *.log
 *.tmp
 raw_assessment_spec.txt
+scratch/
 
 # IDE & OS
 .vscode/

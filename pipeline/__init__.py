@@ -13,6 +13,7 @@ from pipeline.storage import (
     StorageEngine,
     StorageError,
 )
+from pipeline.export import export_device_data
 from pipeline.worker import StorageIngestionWorker
 
 __all__ = [
@@ -20,6 +21,7 @@ __all__ = [
     "CheckpointRecord",
     "ContradictoryLossConflictError",
     "CursorInvariantViolationError",
+    "export_device_data",
     "IngestBatch",
     "IntegrityConflictError",
     "StorageEngine",

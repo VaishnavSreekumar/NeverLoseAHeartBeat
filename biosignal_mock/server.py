@@ -48,6 +48,7 @@ class MockServer:
         fault_config: Optional[FaultConfig] = None,
         ground_truth_tap: Optional[Callable[[dict[str, Any]], None]] = None,
         realtime: bool = True,
+        buffer_capacity: int = 4000,
     ) -> None:
         self.host = host
         self.port = port
@@ -58,6 +59,7 @@ class MockServer:
             mode=mode,
             seed=seed,
             duration=duration,
+            buffer_capacity=buffer_capacity,
             ground_truth_tap=ground_truth_tap,
         )
 
