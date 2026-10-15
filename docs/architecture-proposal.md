@@ -98,14 +98,26 @@ flowchart TD
   4. If invalid: emit `{"cmd": "read", "sensor": 1, "from_index": expected_next_1}`.
   5. Emit `{"cmd": "read", "sensor": 2}`.
   6. Repeat step 3–4 for Sensor 2.
-- **Throughput Balancing:** Target acquisition rate is 800 samples/sec (400 samples $\times$ 2 sensors). Max response chunk is 1 second (400 samples). Polling loop fires at least 4 times per second per sensor to keep buffer lag $< 0.5\text{ s}$.
+- **Stall & Timeout Resilience:** 
+  - To prevent mutual sensor starvation during mock sensor stalls or unresponsiveness, the client socket enforces a strict **1.0-second read timeout** (`sock.settimeout(1.0)`).
+  - If a read for Sensor 1 times out, the client catches the timeout, increments a stall counter, and immediately queries Sensor 2. This prevents a stall on one sensor from blocking the socket and overflowing the other sensor's 10-second (4000 samples) buffer.
+- **Burst Catch-Up Capacity:**
+  - In normal operation (4 Hz polling), each reply delivers ~100 samples in $< 1\text{ ms}$ RTT over loopback TCP, consuming $< 1\%$ of available cycle time.
+  - After a mock pause, each reply delivers up to 400 samples (1.0s of data) in a single RTT. A 5-second backlog (2000 samples) is drained in 5 round-trips ($\approx 8\text{ ms}$), providing a $> 200\times$ catch-up speed that prevents buffer overflow.
 
-### 3.3 Durable Local Write Path
+### 3.3 Durable Local Write Path & Three-Layer Durability
 - **Local Database Engine:** SQLite 3 with Write-Ahead Logging (`PRAGMA journal_mode = WAL;`) and synchronous mode set to `NORMAL` or `FULL`.
-- **Atomic Micro-Batching:** Ingestion thread places validated samples into an internal lock-free bounded queue. A dedicated storage worker consumes from the queue and issues atomic batch inserts:
+- **Three-Layer Durability Model:**
+  1. *Application Commit:* Samples committed to SQLite WAL in user space via `BEGIN IMMEDIATE ... COMMIT`. Resilient against process kill (`SIGKILL`).
+  2. *OS / Filesystem Sync:* Periodic `fsync()` / `fdatasync()` flushes OS dirty page cache to disk controller.
+  3. *Physical Flash Media:* Commodity flash media (MicroSD/eMMC) lacks hardware supercapacitors (PLP). Synchronous per-sample `fsync` causes flash starvation (write amplification $> 50$, 30ms flush latency).
+- **Atomic Micro-Batching Architecture:** Ingestion thread places validated samples into an internal lock-free bounded queue. A dedicated storage worker consumes from the queue and issues atomic batch inserts:
   - Commit interval: every **250 ms** or every **200 samples**.
   - Query: `INSERT OR IGNORE INTO samples (session_id, sensor, sample_index, ch1, ch2, ch3) VALUES (?, ?, ?, ?, ?, ?);`
-- **Crash & Power Protection:** If the OS or application terminates abruptly, WAL recovery replay restores the database to the last clean 250ms commit boundary.
+  - Explicit flush: `fsync()` executed after batch commit.
+- **Durability Classification:**
+  - Structural integrity is guaranteed by SQLite WAL checksums.
+  - The **0.50-second power-loss bound is an UNVERIFIED DESIGN TARGET**. It cannot be claimed as a verified guarantee until empirical testing with sudden unbuffered power cuts is executed and measured on the target storage hardware.
 
 ```mermaid
 sequenceDiagram
@@ -191,14 +203,19 @@ stateDiagram-v2
   $$\text{Total Samples} = 2 \times 3600\text{ s} \times 800\text{ samples/s} = 5,760,000\text{ samples}$$
 - **Required Throughput:** Must catch up within 15 minutes (900 seconds):
   $$\text{Required Throughput} = \frac{5,760,000}{900\text{ s}} \approx 6,400\text{ samples/second}$$
-- **Ingestion Batching Design:**
-  - In individual HTTP requests, 6,400 req/s will fail.
-  - The synchronizer bundles **2,000 samples per batch** (using gzip-compressed JSON or compact binary payloads).
-  - Total requests for 2 hours of data:
-    $$\frac{5,760,000}{2,000} = 2,880\text{ HTTP POSTs}$$
-  - Average request rate:
-    $$\frac{2,880}{900\text{ s}} = 3.2\text{ requests/second}$$
-  - A cadence of 3.2 requests/sec of ~50 KB payloads is easily accommodated by any standard free-tier web server.
+- **Storage & Network Recalculation:**
+  - Raw JSON: $\approx 65\text{ bytes/sample} \implies 374.4\text{ MB}$.
+  - Compact array JSON: $\approx 30\text{ bytes/sample} \implies 172.8\text{ MB}$.
+  - Gzip wire transfer: $\approx 38.4\text{ MB}$ to $80\text{ MB}$ ($\approx 89\text{ KB/s}$ over 900s).
+  - **Database Storage Quota Risk:** In PostgreSQL, individual sample rows incur ~88 bytes each (tuple header + fields + primary key B-tree index). 5.76 million rows consume $\mathbf{\approx 506.8\text{ MB}}$, which **exceeds or exhausts free-tier limits** (Supabase: 500 MB, Neon: 512 MB).
+- **Architectural Schema Mitigation (Chunked Cloud Rows):**
+  - Rather than storing 5.76 million individual sample rows, the cloud database stores **1-second sample chunk rows** (400 samples per row, 14,400 rows total) or binary bytea blocks.
+  - This reduces database metadata and index overhead by $> 95\%$, slashing database disk footprint to $<\mathbf{25\text{ MB}}$ and keeping the system comfortably within free-tier quotas.
+- **Batching & Cadence:**
+  - Synchronizer pushes batches of 2,000 samples per HTTP POST payload ($2,880\text{ requests}$ over 900 seconds = **3.2 requests/second**).
+- **Target Classification:**
+  > [!IMPORTANT]
+  > The 15-minute catch-up deadline is an **UNVERIFIED TARGET**. It must be validated via a representative benchmark measuring end-to-end network transfer and cloud database persistence before declaring compliance.
 
 ### 3.9 Required CLI Commands
 The single CLI tool `pipeline` provides three subcommands:
@@ -215,15 +232,43 @@ The single CLI tool `pipeline` provides three subcommands:
 3. `pipeline results --session <ID>`:
    - Streams NDJSON of window metric objects conforming to Section 3.
 
-### 3.10 Ground-Truth Recording & Comparison
-- **Independent Verification Tool (`tools/check_ground_truth.py`):**
-  - Consumes the raw ground-truth generation log (or re-generates it deterministically using `--mode ramp/signal --seed S`).
-  - Reads `pipeline export` NDJSON.
-  - Validates:
-    1. Sample count: Every generated sample is either present on disk with exact values or explicitly listed in the loss ledger.
-    2. Zero duplicates: No index appears more than once.
-    3. Value fidelity: Every channel value matches ground truth bit-for-bit.
-    4. Window result accuracy: Recomputes Section 3 formulas and compares against `pipeline results`.
+### 3.10 Independent Candidate Ground-Truth Recorder & Auditor
+To ensure zero silent data loss before submission, the architecture includes an **independent verification subsystem** completely decoupled from the device pipeline:
+
+```mermaid
+flowchart LR
+    subgraph MockSubsystem["biosignal-mock Daemon"]
+        GenCore[Generator Core] --> Tap[Independent Ground-Truth Tap]
+        GenCore --> MockBuf[Ring Buffer & TCP]
+        Tap --> GTLog[(Independent Ground Truth Log\nground_truth.ndjson)]
+    end
+
+    subgraph PipelineSubsystem["Device Pipeline Daemon"]
+        MockBuf --> PipeIngest[Acquisition & Storage]
+        PipeIngest --> PipeExport[pipeline export]
+    end
+
+    subgraph AuditorSubsystem["Independent Candidate Verification"]
+        GTLog --> Checker[tools/check_ground_truth.py]
+        PipeExport --> Checker
+        Checker --> AuditReport[Zero Silent Loss Report]
+    end
+```
+
+1. **Independent Candidate Ground-Truth Recorder:**
+   - Embedded directly as an independent recording tap at the mock generation core.
+   - Records the actual generated stream at creation: `(session_id, sensor, sample_index, values, timestamp)`.
+   - Records all mock session transitions (`new_session_id`, `session_end: false`).
+   - Records all mock ring-buffer overflow events directly from the mock buffer tracker.
+   - Writes directly to an independent, append-only ground-truth stream (`ground_truth.ndjson`), completely separate from any pipeline database or state.
+2. **Independent Candidate Ground-Truth Checker (`tools/check_ground_truth.py`):**
+   - Strictly does NOT rely on pipeline-generated truth, pipeline SQLite tables, or internal pipeline logs.
+   - Consumes the independent ground-truth log and compares it against the output of `pipeline export --from device` (or `--from cloud`).
+   - Auditing Verification Engine:
+     - **Missing Samples Detection:** Identifies every index emitted by the generator that is absent from the export. Flags defect unless accounted for by an explicit mock drop event.
+     - **Duplicate Samples Detection:** Identifies any sample index that appears more than once in the export stream.
+     - **Altered Values Detection:** Compares every channel value bit-for-bit against ground-truth math.
+     - **Unaccounted Loss Audit:** Cross-checks exported `loss_ledger` records against ground-truth drop events. Flags any invented loss or unrecorded gap.
 
 ---
 
@@ -283,7 +328,7 @@ stateDiagram-v2
    - **Semantics:** Frame received, NDJSON parsed, CRC-32 verified. **CRITICAL:** A sample in `RECEIVED` state is NOT yet safe. A process kill or power cut will destroy it. It must NEVER be reported as saved or acknowledged.
 3. **State: DURABLY COMMITTED (Local Disk)**
    - **Location:** SQLite database file on physical storage (`PRAGMA journal_mode = WAL;`, `fsync()` completed).
-   - **Semantics:** The transaction batch has committed and the kernel has flushed bytes to non-volatile media. It will survive process kill (`SIGKILL`), reboot, and physical power loss within the guaranteed 0.5s bound.
+   - **Semantics:** The transaction batch has committed and the kernel has flushed bytes to non-volatile media. It will survive process kill (`SIGKILL`), reboot, and physical power loss within the targeted 0.5s bound (empirically unverified target).
 4. **State: CLOUD ACKNOWLEDGED (Remote Persistent Store)**
    - **Location:** Cloud PostgreSQL / LibSQL database.
    - **Semantics:** An HTTP write is NOT considered safe upon socket write or HTTP return code alone. The cloud endpoint returns an explicit JSON payload confirming `{"acknowledged_up_to": {"1": idx1, "2": idx2}}` after durable commit in the cloud database. Only upon parsing this acknowledgment does the device advance its `cloud_synced_checkpoint`.
@@ -293,7 +338,7 @@ stateDiagram-v2
 
 ---
 
-## 5. Engineering Boundaries & Scope Discipline
+## 5. Engineering Boundaries, Scope Discipline & Phase 1 Review Gate
 
 1. **Simplest Viable Architecture:**
    - Every dependency is justified: standard Python 3.13 standard library (`asyncio`, `sqlite3`, `socket`, `zlib`) for edge acquisition; FastAPI + Uvicorn for standard HTTP ingestion; pytest for testing. No unnecessary message brokers, no heavyweight ORMs, no external C libraries.
@@ -301,4 +346,11 @@ stateDiagram-v2
    - The synthetic ECG and PPG signals generated in `--mode signal` are strictly for software systems verification (heart rate peak detection, frequency tracking, stress testing). They are not intended for clinical diagnosis, patient monitoring, or medical device certification.
 3. **Transparency of Uncertain States:**
    - When a session restarts or an unannounced crash occurs, the exact end of missing data may be unknown. The pipeline records `to_index: null` rather than guessing the boundary.
+4. **Strict Scope Enforcement for Phase 1:**
+   - Phase 1 is **strictly confined** to:
+     - `shared/protocol.py` (message schemas, zlib CRC-32 validation).
+     - `biosignal_mock/` (NDJSON TCP server, 400 Hz ramp/signal generator, 10s ring buffer, fault injector).
+     - Independent candidate ground-truth recording tap.
+     - Mock-specific unit test suites (`tests/test_mock_protocol.py`, `tests/test_generator.py`).
+   - **Explicit Negative Scope:** No device pipeline daemon, SQLite storage engine, mode manager, CLI commands, or cloud ingestion components may be started in Phase 1.
 

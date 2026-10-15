@@ -50,58 +50,63 @@ In a reliability-critical medical pipeline, automated testing is the only defens
 | **TST-01** | `test_protocol_framing_and_crc` | REQ-A-07, REQ-A-09, REQ-A-10 | Unit test with valid and corrupted NDJSON frames | CRC matches `zlib.crc32(raw_bytes)`; malformed frames rejected. |
 | **TST-02** | `test_ramp_mode_deterministic` | REQ-A-05, REQ-A-06 | Generate $10^5$ samples with seed 7; assert formulas | Bit-for-bit match with $(3i+c) \bmod 8388608$ and $(2i+c) \bmod 8388608$. |
 | **TST-03** | `test_signal_mode_synthetics` | REQ-A-03, REQ-A-04 | 10-minute signal generation run; detect peaks | Channel 2 HR matches 60, 90, 72 bpm cycle; Ch1=0.6*Ch2; Ch3=1.3*Ch2. |
-| **TST-04** | `test_interleaved_sensor_polling` | REQ-A-01, REQ-B-01, REQ-B-02 | Mock with 2 sensors; run client ingestion for 60s | Both sensors ingested at 400 Hz average; zero buffer overflows. |
+| **TST-04** | `test_interleaved_sensor_polling_under_faults` | REQ-A-01, REQ-B-01, REQ-B-02 | Inject 5s sensor stall, 10% corrupt CRC, and duplicate frames on single TCP socket | Client alternates queries without deadlock; neither sensor's buffer exceeds 70% capacity (7s lag); zero unforced overflow. |
 | **TST-05** | `test_buffer_overflow_loss_logging` | REQ-A-11, REQ-B-08, REQ-H-05 | Pause client read for 12 seconds; resume read | Mock returns `lost` range; loss recorded in `loss_ledger`; zero silent loss. |
 | **TST-06** | `test_crc_corruption_and_reread` | REQ-B-04, REQ-A-12 | Inject 10% corrupted CRC responses in mock | Pipeline rejects corrupt frames, requests `from_index`, recovers valid data. |
 | **TST-07** | `test_duplicate_response_rejection` | REQ-B-05, REQ-E-03 | Inject duplicate replies from mock | Local SQLite maintains unique sample count; zero primary key collisions. |
 | **TST-08** | `test_session_restart_unknown_end` | REQ-E-04, REQ-A-12 | Mock restarts during run; new session ID generated | Loss recorded with `to_index: null` and reason `session_restart`. |
-| **TST-09** | `test_sqlite_batch_durability` | REQ-B-03, REQ-B-06, REQ-B-07 | Commit batching test; assert WAL mode and sync | Bounded commit window ($\le 250$ ms); transactions atomic on crash. |
+| **TST-09** | `test_sqlite_batch_durability_and_power_loss` | REQ-B-03, REQ-B-06, REQ-B-07 | Abrupt unbuffered crash / power cut during active ingestion | `PRAGMA integrity_check` clean; loss gap $(i_{\text{cut}} - i_{\text{committed}})/400 \le \text{Target Bound}$ (0.5s); gap logged in `loss_ledger`. |
 | **TST-10** | `test_section3_window_metrics` | REQ-F-01..05, REQ-F-14 | Synthetic 1s windows with known statistics | Exact match for mean, min, max, magnitude, missing counts; 1-decimal round. |
 | **TST-11** | `test_heart_rate_4_rules` | REQ-F-06..13 | Edge cases: $w<4$, missing samples, refractory spacing | Null on missing sample in 5s; exact bpm match on synthetic peaks. |
 | **TST-12** | `test_online_offline_code_parity` | REQ-C-05, REQ-D-02, REQ-D-03 | Execute same dataset through online and offline paths | Outputs are mathematically identical with respective `mode` tags. |
 | **TST-13** | `test_mode_switch_timing` | REQ-D-04, REQ-D-05, REQ-D-06 | Drop network, restore network; measure transition times | Offline mode active $\le 10$s after drop; online active $\le 10$s after restore. |
-| **TST-14** | `test_cloud_catchup_throughput` | REQ-E-01, REQ-E-02 | Simulate 2-hour backlog (5.76M samples); run sync | Catch-up completes in $< 15$ minutes ($\ge 6,400$ samples/sec). |
+| **TST-14** | `test_cloud_catchup_benchmark` | REQ-E-01, REQ-E-02, REQ-C-04 | Representative benchmark: 5.76M samples uploaded to candidate cloud endpoint | Sync completes in $< 15$ minutes ($\ge 6,400$ samples/s); cloud database storage consumption remains $<\text{Free-Tier Quota}$ (500 MB). |
 | **TST-15** | `test_clock_change_invariance` | REQ-H-06 | Shift system clock $\pm 2$ hours during active session | 0 skipped samples, 0 window misalignment, 0 assertion errors. |
 | **TST-16** | `test_disk_full_resilience` | REQ-H-07 | Mount 50MB loopback disk; exhaust storage | Pipeline logs disk pressure, halts writes cleanly, passes DB integrity check. |
 | **TST-17** | `test_arm64_resource_limits` | REQ-H-01, REQ-H-02, REQ-H-03 | 1-hour run in 4-core, 2 GB cgroup | Mean CPU $< 25\%$, Peak RSS $< 150$ MB, disk and network logged. |
 
 ---
 
-## 4. Verification Tool Design: Candidate Ground-Truth Checker
+## 4. Verification Subsystem: Independent Candidate Ground-Truth Recorder & Auditor
 
-To guarantee zero silent data loss before submission, we design an independent ground-truth recording and auditing tool (`tools/check_ground_truth.py`).
+To guarantee zero silent data loss before submission, we design an independent ground-truth recording and auditing subsystem (`tools/check_ground_truth.py`).
 
-> [!NOTE]
-> This tool is developed as an internal candidate engineering test harness to ensure compliance with MayaCardio Criterion 1, 2, and 7. It is not represented as an official MayaCardio artifact.
+> [!IMPORTANT]
+> The Candidate Ground-Truth Recorder and Checker are strictly independent verification components developed by the candidate to guarantee compliance with Criteria 1, 2, and 7. They do NOT rely on pipeline-generated truth, pipeline databases, or pipeline loss ledgers.
 
-### Architecture of `check_ground_truth.py`
-1. **Input A (Ground Truth):**
-   - For `--mode ramp`: Recomputes expected sample values deterministically from sample index $0$ to $N$.
-   - For `--mode signal`: Reads parallel ground-truth stream recorded directly at generation source.
-2. **Input B (Pipeline Export):**
-   - Reads NDJSON stream from `pipeline export --session <ID> --from device` (or `--from cloud`).
+### 4.1 Independent Candidate Ground-Truth Recorder
+1. **Source Tap:** Embedded directly inside the mock generator loop.
+2. **Recorded Events:**
+   - Every generated sample: `{"session_id": S, "sensor": X, "index": i, "values": [...], "ts": float}`.
+   - Every session reset / restart event: `{"event": "session_restart", "old_session_id": S1, "new_session_id": S2}`.
+   - Every ring-buffer overflow event: `{"event": "buffer_drop", "sensor": X, "from_index": i1, "to_index": i2}`.
+3. **Storage:** Written directly to an independent, append-only log file (`ground_truth.ndjson`).
+
+### 4.2 Independent Candidate Ground-Truth Checker (`tools/check_ground_truth.py`)
+1. **Input A (Independent Ground Truth):** Reconstructs or reads `ground_truth.ndjson`.
+2. **Input B (Pipeline Export):** Reads NDJSON from `pipeline export --session <ID> --from [device|cloud]`.
 3. **Auditing Verification Algorithm:**
-   - **Step 1 (Sample Set Construction):** Populates index set of received samples and checks for duplicate indices.
-   - **Step 2 (Loss Ledger Accounting):** Reconciles missing index spans against exported loss records.
-   - **Step 3 (Zero Silent Loss Invariant):**
-     $$\text{Total Expected Indices} = \text{Count}(\text{Saved Samples}) + \sum_{\text{losses}} (\text{to\_index} - \text{from\_index} + 1)$$
-     If any single index in the range $[0, \max(\text{index})]$ is neither in saved samples nor covered by an explicit loss entry, the tool flags a **SILENT LOSS DEFECT** with the exact index and sensor.
-   - **Step 4 (Value Verification):** Verifies bit-for-bit equality of channel values against ground-truth math.
-   - **Step 5 (Analytics Parity):** Verifies Section 3 statistics against exported `pipeline results`.
+   - **Missing Samples Audit:** Every sample emitted by the generator must appear in the export, UNLESS the mock generator logged an explicit buffer overflow. Any unaccounted sample is flagged as a **SILENT LOSS DEFECT**.
+   - **Duplicate Samples Audit:** The export is audited for repeated `(session_id, sensor, sample_index)` keys. Any duplicate is flagged as a **DUPLICATION DEFECT**.
+   - **Altered Values Audit:** Emitted channel values are compared bit-for-bit against ground-truth integer arrays. Any divergence is flagged as a **CORRUPTION DEFECT**.
+   - **Loss Ledger Reconciliation:** Exported loss records are reconciled against the mock's actual drop events. Any invented loss or discrepancy is flagged.
+   - **Window Analytics Parity:** Section 3 summary statistics and ECG peak detection rules are independently recomputed and compared against `pipeline results`.
 
 ---
 
 ## 5. Linux & ARM64 Specific Test Procedures
 
-### 5.1 Sudden Power-Loss Verification
-- **Test Environment:** ARM64 Linux VM (or Raspberry Pi with smart relay) or container hard kill.
+### 5.1 Sudden Power-Loss Verification (Empirical Measurement Procedure)
+- **Test Environment:** ARM64 Linux VM, Raspberry Pi with hardware power relay, or kernel crash emulation (`echo c > /proc/sysrq-trigger`).
 - **Procedure:**
-  1. Start `pipeline` ingesting both sensors.
-  2. Verify active ingestion for 60 seconds.
-  3. Execute hardware reset or ungraceful VM termination (`echo c > /proc/sysrq-trigger` or host power severance).
+  1. Start `pipeline` ingesting both sensors at 800 Hz against deterministic ramp data.
+  2. Ground-truth recorder logs timestamp and index $i_{\text{cut}}$ at the exact millisecond of power severance.
+  3. Execute abrupt, unannounced power severance (physical power disconnect or kernel sysrq crash).
   4. Boot system, launch pipeline recovery audit.
-  5. Compare database contents with ground truth.
-  6. **Acceptance:** Database opens cleanly; lost sample span is $\le 0.5$ seconds; loss is logged.
+  5. Execute `PRAGMA integrity_check;` to verify zero SQLite database or WAL page corruption.
+  6. Query `SELECT MAX(sample_index) FROM samples WHERE sensor = 1;` to determine $i_{\text{committed}}$.
+  7. Compute empirical loss: $\Delta t = (i_{\text{cut}} - i_{\text{committed}}) / 400.0\text{ seconds}$.
+  8. **Acceptance Condition:** Database opens cleanly; measured loss $\Delta t \le \text{Target Bound}$ (0.50s); post-boot recovery detects the gap and logs an entry in `loss_ledger` with reason `power_loss_interruption`.
 
 ### 5.2 Network Severance & Automatic Switching Verification
 - **Test Environment:** Linux system with `iptables` / `tc`.

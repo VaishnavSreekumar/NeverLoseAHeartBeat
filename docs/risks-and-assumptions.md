@@ -9,34 +9,50 @@
 
 ## 1. Executive Summary & Defensible Durability Guarantee
 
-### 1.1 The Reality of Physical Power Loss
-In safety-critical medical and embedded systems, claiming "zero data loss under arbitrary, unannounced physical power severance" without dedicated battery-backed NVRAM or hardware Super-Capacitor Power-Loss Protection (PLP) is technically indefensible. 
+### 1.1 The Reality of Physical Power Loss: The Three-Layer Durability Model
+In safety-critical medical and embedded systems, claiming "zero data loss under arbitrary, unannounced physical power severance" without dedicated battery-backed NVRAM or hardware Super-Capacitor Power-Loss Protection (PLP) is technically indefensible. A systems engineer must distinguish three distinct layers of durability:
 
-Flash memory controllers on standard MicroSD cards or commodity eMMC modules experience in-flight block writes when $V_{cc}$ drops below operating threshold. If an application attempts synchronous per-sample disk writes (800 `fsync` calls per second), two catastrophic failures occur:
-1. MicroSD/eMMC write latency (typically 5–30 ms per random synchronous flush) instantly causes ingestion thread starvation, causing the mock service's 10-second ring buffer to overflow.
-2. Rapid flash endurance degradation (write amplification factor $> 50$) leading to premature media failure.
+1. **Layer 1: Application-Level Commit (SQLite WAL)**
+   - When SQLite finishes `COMMIT`, transactions are serialized into the WAL file in user space and passed to the operating system kernel via `write()`.
+   - Data is safe against user-space application crashes (`SIGKILL`, segfaults), but remains in the OS dirty page cache.
+2. **Layer 2: OS & Filesystem Durability (`fsync` / `fdatasync`)**
+   - The OS kernel flushes dirty file system pages from the page cache to the physical disk controller queue.
+   - Data is safe against OS kernel panics, but may still reside in the volatile write-back cache of the disk controller.
+3. **Layer 3: Physical Storage Controller & Flash Media Guarantees**
+   - Commodity storage (Raspberry Pi MicroSD cards, USB flash, cheap eMMC) contains proprietary firmware and internal volatile SRAM/DRAM caches without power-loss protection (PLP).
+   - When physical $V_{cc}$ collapses abruptly during a flash page erase/program cycle, in-flight writes can result in torn blocks, or data in the volatile controller buffer can be lost.
+   - Synchronous per-sample disk writes (800 `fsync` calls/s) cause extreme flash write amplification (WAF $> 50$) and stall the ingestion loop (flash write latency spikes to 30–100 ms).
 
-### 1.2 MayaCardio Defensible Durability Guarantee
-Under sudden physical power loss, the pipeline guarantees:
-1. **Structural Database Integrity:** The SQLite database file and Write-Ahead Log (WAL) will recover to an internally consistent state without page corruption or unrecoverable indices.
-2. **Strictly Bounded Loss Window:** At most **0.50 seconds** (200 samples per sensor, 400 samples total) of in-flight received data will be lost during a sudden power cut.
-3. **Auditability & Discontinuity Accounting:** On reboot, the ingestion engine detects any gap between the last committed sample index and the first sample received from the new/reconnected session, immediately logging an auditable entry into the local `loss_ledger`.
-4. **Hardware Assumptions:** The host kernel accurately reports `fsync()` completion, and the underlying storage controller does not corrupt previously committed blocks during power collapse.
+### 1.2 Durability Specification: Targets vs. Proven Guarantees
+- **Structural Database Integrity:** Guaranteed by SQLite Write-Ahead Logging (`PRAGMA journal_mode = WAL;`) and checksummed WAL frame headers. On reboot, WAL recovery automatically recovers to the last committed atomic frame.
+- **Unverified Target Loss Bound:** A target loss window of **$\le 0.50$ seconds** (at most 200 samples per sensor, 400 samples total) is established based on a 250ms batch commit cadence.
+  > [!IMPORTANT]
+  > This 0.50-second bound is an **UNVERIFIED DESIGN TARGET**. It cannot be claimed as a verified guarantee until empirical testing with sudden unbuffered power cuts is executed and measured on the target storage hardware.
+- **Auditability & Discontinuity Accounting:** On reboot, the pipeline inspects `MAX(sample_index)` from the database and the first sample received from the reconnected mock, immediately logging any gap into `loss_ledger` with reason `power_loss_interruption`.
+- **Underlying Assumptions:** The host kernel flushes page cache on `fsync()`, and the storage media controller guarantees that committed sectors are not corrupted by neighboring write collapses.
 
 ---
 
 ## 2. In-Depth Engineering Risk Analysis
 
 ### Risk 01: Durability During Sudden Power Loss
-* **Failure Scenario:** Power cord is yanked from the Raspberry Pi or host system while writes to the database are actively occurring.
-* **Likely Consequence:** Corrupted database header, half-written WAL frames, or uncommitted in-memory buffer loss leading to silent sample omission and severe scoring deductions.
+* **Failure Scenario:** Power cord is pulled from the Raspberry Pi or host system while writes to the database are actively occurring.
+* **Likely Consequence:** Corrupted database header, torn WAL frames, or uncommitted in-memory buffer loss leading to silent sample omission and severe scoring deductions.
 * **Mitigation:** 
   - Employ SQLite with Write-Ahead Logging (`PRAGMA journal_mode = WAL;`).
   - Use `PRAGMA synchronous = FULL;` (or `PRAGMA synchronous = NORMAL;` combined with bounded micro-batch transactions).
-  - Group incoming sensor samples into atomic micro-batches committed every **250 ms** or 100 samples per sensor.
+  - Group incoming sensor samples into atomic micro-batches committed every **250 ms** (100 samples per sensor).
   - Wrap batch writes in an explicit transaction (`BEGIN IMMEDIATE ... COMMIT`) followed by a controlled sync.
   - On restart, SQLite automatically runs WAL recovery to restore the database to the last committed atomic transaction.
-* **Test Required:** Run continuous ingestion while issuing an abrupt hardware/container reset (or VM hard reset simulation). On restart, execute `PRAGMA integrity_check;`, calculate the missing sample span, and confirm it is $\le 0.5$ seconds.
+* **Exact Empirical Test Required to Establish Defensible Bound:**
+  1. Start continuous dual-sensor ingestion at 800 Hz against mock generating deterministic ramp data.
+  2. Record parallel ground-truth timestamp and generation index at source.
+  3. Trigger an abrupt, unannounced power severance (via hardware relay, physical power cut, or Linux kernel hard crash trigger `echo c > /proc/sysrq-trigger`).
+  4. Reboot system, mount filesystem, execute `PRAGMA integrity_check;` to verify structural zero-corruption.
+  5. Query `SELECT MAX(sample_index) FROM samples WHERE sensor = 1;` to determine the last durably committed sample $i_{\text{committed}}$.
+  6. Compare $i_{\text{committed}}$ against the ground-truth index $i_{\text{cut}}$ emitted at the exact millisecond of power severance.
+  7. Compute empirical loss: $\Delta t = (i_{\text{cut}} - i_{\text{committed}}) / 400.0\text{ seconds}$.
+  8. Verify that $\Delta t \le \text{Stated Target Bound}$, and verify that post-boot pipeline logs the gap in `loss_ledger`.
 
 ---
 
@@ -88,13 +104,23 @@ Under sudden physical power loss, the pipeline guarantees:
 ---
 
 ### Risk 06: Simultaneous Collection from Two Sensors over Single TCP Socket
-* **Failure Scenario:** Both sensors run at 400 Hz (total 800 samples/sec). However, the mock service only accepts a single TCP client connection and requires explicit read requests specifying `"sensor": 1` or `"sensor": 2`.
-* **Likely Consequence:** If the pipeline reads Sensor 1 sequentially for too long, Sensor 2's 10-second ring buffer overflows, causing unforced data loss.
-* **Mitigation:**
-  - Implement a round-robin interleaved polling scheduler over the single connection: dispatch `read(sensor=1)`, await reply, dispatch `read(sensor=2)`, await reply.
-  - Balance requests dynamically based on the returned `count` and backlog hints.
-  - Maintain a maximum batch size of 400 samples (1.0 second) per read to ensure both sensors are serviced at least twice per second.
-* **Test Required:** Run high-throughput ingestion with both sensors for 30 minutes. Measure buffer lag and verify that neither sensor ever lags by more than 1.5 seconds.
+* **Protocol & Transport Constraints:**
+  - Both sensors generate data continuously at 400 Hz (total 800 samples/sec, 1 sample every 2.5 ms per sensor).
+  - The mock service operates strictly as a single-client TCP server with a request-response protocol (`{"cmd": "read", "sensor": S}`).
+  - Each reply contains at most 1 second of data (`count <= 400`).
+  - The mock's internal ring buffer holds only the last 10 seconds (4000 samples per sensor). Older unread samples are permanently dropped.
+* **Failure Scenarios & Bottleneck Analysis:**
+  1. *Starvation via Sequential Polling:* If the client polls Sensor 1 continuously or waits too long between polls, Sensor 2 accumulates unread samples at 400 samples/sec and overflows its 10-second ring buffer within 10.0 seconds.
+  2. *Sensor Stall Deadlock:* The mock intentionally stalls or stops sending one sensor. If the client executes a blocking `socket.recv()` waiting for that sensor's reply, the entire polling loop blocks, starving the other sensor and causing ring buffer overflow on both.
+  3. *Corrupt CRC Re-read Delays:* If replies are corrupted, client must issue re-read commands (`from_index`). Multiple sequential re-reads could consume polling cycle time.
+  4. *Duplicate Reply Ingestion Latency:* Processing redundant replies must not introduce I/O stalls that back up the TCP stream.
+* **Mitigation & Mathematical Feasibility Validation:**
+  - **Strict Round-Robin Scheduler:** The ingestion loop strictly alternates polling: `read(sensor=1) -> process -> read(sensor=2) -> process`.
+  - **Non-Blocking / Timed Socket I/O:** The TCP socket uses a strict **1.0-second read timeout** (`sock.settimeout(1.0)`). If a sensor read times out (e.g. mock stall), the client immediately logs a communication event and switches to poll the other sensor, preventing mutual starvation.
+  - **Nominal Cadence & Margin:** In normal operation at 4 Hz polling (every 250 ms), each read retrieves ~100 samples. Over local TCP loopback, round-trip request-reply latency is $< 1.0\text{ ms}$. Total round-trip time for both sensors is $< 2.5\text{ ms}$ per 250ms window, yielding an operational safety margin of **$> 99\%$ idle/buffer margin**.
+  - **Burst Backlog Catch-Up:** When catching up after a stall, each reply returns up to 400 samples (1.0 second of data) in a single $\approx 1\text{ ms}$ round trip. The client can drain 4,000 samples (10 seconds of data) in 10 sequential round trips ($\approx 15\text{ ms}$), catching up at **$> 200\times$ real-time speed**, easily preventing buffer overflow as long as the mock resumes before 10 seconds elapse.
+  - **Duplicate & Corrupt Re-read Bounding:** CRC verification is in-memory pure integer zlib ($< 0.1\text{ ms}$). Re-reads are bounded to 3 attempts before declaring an unrecoverable gap in `loss_ledger`. Duplicate frames are detected via `first_index < expected_index` in memory and dropped without disk overhead.
+* **Test Required:** Run stress-test harness injecting 5-second selective sensor stalls, 10% corrupted CRCs, and duplicated replies under full 800 Hz generation. Verify that neither sensor's buffer exceeds 70% capacity (7.0 seconds lag) and zero unforced buffer overflow occurs.
 
 ---
 
@@ -185,15 +211,27 @@ Under sudden physical power loss, the pipeline guarantees:
 
 ---
 
-### Risk 14: Free-Tier Cloud Limitations & Catch-Up Throughput
+### Risk 14: Free-Tier Cloud Limitations, Database Overhead & Catch-Up Throughput
 * **Failure Scenario:** 
-  1. The free cloud hosting provider (e.g. Render, Koyeb) puts inactive services to sleep, causing high cold-start latencies ($> 30\text{ s}$) that violate the 5-second online SLA.
-  2. Following a 2-hour network outage, the device must upload 5,760,000 backlogged samples within 15 minutes (900 seconds). If uploads are sent with small payloads, the required 6,400 samples/sec will exceed free HTTP rate limits or connection quotas.
-* **Likely Consequence:** SLA breach (Criterion 4), timeout during catch-up (Criterion 6), or account suspension for rate abuse.
-* **Mitigation:**
-  - Choose a free cloud platform with sustained availability or keep-alive pings (e.g. Supabase / Neon direct pooled database or a lightweight FastAPI service on a non-sleeping tier).
-  - **High-Density Batch Ingestion:** Backlog sync bundles 2,000 samples per HTTP POST payload in a compressed binary or compact JSON array format. At 2,000 samples/batch, catching up 5.76 million samples requires only 2,880 requests over 900 seconds $\approx$ **3.2 HTTP requests per second**. This easily complies with all cloud free-tier rate limits.
-* **Test Required:** Benchmark batch upload of 5.76 million synthetic samples to candidate cloud endpoints and measure completion time (target $< 15\text{ minutes}$).
+  1. The free cloud hosting provider (e.g. Render) spins down inactive services, causing 50+ second cold-start delays that violate the 5-second online SLA.
+  2. Following a 2-hour outage ($5,760,000$ samples), the device attempts to upload the backlog within 15 minutes (900 seconds). High network payload size or individual row inserts in cloud Postgres choke bandwidth or trigger API rate limits.
+  3. **Critical Storage Breach:** Storing 5,760,000 individual sample rows in a free cloud database exhausts the provider's free storage quota (e.g. Supabase 500 MB, Neon 512 MB).
+* **Storage & Network Rigorous Recalculation:**
+  - **Sample Volume:** 2 hours $\times$ 3,600 s $\times$ 800 samples/s = **5,760,000 samples**.
+  - **Raw JSON Network Payload:** `{"sensor": 1, "index": 120000, "values": [720, 1200, 1560]}` $\approx 65\text{ bytes/sample}$. Total raw payload = $5.76\text{M} \times 65\text{ B} \approx \mathbf{374.4\text{ MB}}$.
+  - **Compact JSON Array Payload:** `[1, 120000, 720, 1200, 1560]` $\approx 30\text{ bytes/sample}$. Total uncompressed = $\mathbf{172.8\text{ MB}}$.
+  - **Gzip Compressed Transfer:** Applying gzip compression (ratio $\approx 4.5:1$) reduces total wire transfer to $\approx \mathbf{38.4\text{ MB}}$ (or $\approx 80\text{ MB}$ for raw JSON). Required bandwidth over 900 seconds: $80\text{ MB} / 900\text{ s} \approx 89\text{ KB/s}$ (712 kbps), easily sustainable over standard broadband.
+  - **Cloud Database Row & Index Overhead:**
+    - In PostgreSQL, each table row incurs: Heap tuple header (24 bytes) + column data (24–32 bytes) + padding + B-tree index entry on `(session_id, sensor, sample_index)` (~32 bytes) $\approx \mathbf{88\text{ bytes per row}}$.
+    - For 5.76 million individual rows: $5,760,000 \times 88\text{ B} \approx \mathbf{506.8\text{ MB}}$.
+    - **QUOTA EXHAUSTION DEFECT:** Supabase free tier provides **500 MB**; Neon provides **512 MB**. Storing one 2-hour outage as individual row items will **exhaust or crash the free-tier database quota**.
+* **Mitigations & Architectural Schema Design:**
+  - **Chunked Sample Storage in Cloud:** Instead of 1 row per sample (5.76M rows), store samples in 1-second chunks (400 samples/row, 14,400 rows total) or binary bytea blobs in PostgreSQL. This eliminates $>95\%$ of row header and B-tree index overhead, shrinking database footprint from $>500\text{ MB}$ to $<\mathbf{25\text{ MB}}$.
+  - **High-Density HTTP Upload:** Stream batches of 2,000 samples per HTTP POST payload ($2,880\text{ requests}$ over 900 seconds = **3.2 requests/second**), completely within free-tier rate limits.
+  - **Unverified Target Status:**
+    > [!IMPORTANT]
+    > The 15-minute catch-up SLA ($< 900\text{ s}$) and cloud free-tier viability are classified as **UNVERIFIED TARGETS**. They must be empirically benchmarked against the live target cloud provider before claiming verified feasibility.
+* **Empirical Test Required:** Execute a representative catch-up benchmark uploading 5.76 million synthetic samples to candidate cloud endpoints, measuring end-to-end sync duration, network egress, and cloud database disk space consumption.
 
 ---
 

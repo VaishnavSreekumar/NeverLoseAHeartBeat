@@ -70,13 +70,22 @@ gantt
   - `docs/delivery-plan.md`
 * **Exit Gate:** All requirements classified, environment inspected, test plan established, architecture approved.
 
-#### Phase 1: Shared Core & Independent Mock Service (Hours 3 – 9)
+#### Phase 1: Shared Core & Independent Mock Service (Strict Scope Boundary)
 * **Time:** Oct 14, 19:30 – Oct 15, 01:30 IST
-* **Deliverables:**
-  - `biosignal_mock/` implementation: ramp mode, signal mode, TCP server, NDJSON framing, zlib CRC-32 calculation, 10s ring buffer, fault injector.
-  - `shared/protocol.py`: shared message models, CRC validation utility.
-  - Automated unit tests (`tests/test_mock_protocol.py`, `tests/test_generator.py`).
-* **Exit Gate:** Mock generates deterministic ramp and realistic ECG/PPG signals, passes CRC self-check, handles `from_index` re-reads, and responds to fault injection flags.
+* **Deliverables (Strict In-Scope):**
+  - `shared/protocol.py`: shared NDJSON models, exact zlib CRC-32 validation utility.
+  - `biosignal_mock/generator.py`: 400 Hz dual-sensor generator core.
+  - `biosignal_mock/ramp.py`: deterministic ramp formula `(3i+c) mod 8388608` and `(2i+c) mod 8388608`.
+  - `biosignal_mock/signal.py`: realistic ECG/PPG synthetic signal generator.
+  - `biosignal_mock/buffer.py`: 10-second (4000 samples) ring buffer with explicit overflow tracking and `lost` payload generation.
+  - `biosignal_mock/server.py`: single-client TCP server with NDJSON framing and request-response loop.
+  - `biosignal_mock/faults.py`: fault injection hooks (stalls, corrupted CRC-32, duplicate frames, session restarts).
+  - Independent Candidate Ground-Truth Recording Tap: source-level recorder emitting `ground_truth.ndjson`.
+  - Mock-specific automated unit test suites (`tests/test_mock_protocol.py`, `tests/test_generator.py`).
+* **Explicit Negative Scope (Out of Scope for Phase 1):**
+  - DO NOT implement `pipeline/` (no transport, storage, loss ledger, mode manager, or CLI).
+  - DO NOT implement `cloud_service/` (no FastAPI gateway, cloud database, or sync endpoints).
+* **Exit Gate:** All Category A requirements (`REQ-A-01` through `REQ-A-12`) verified and marked `TESTED_PASSED`. Mock verified to implement protocol and faults; independent ground-truth tap verified operational. Stop for candidate review before starting Phase 2.
 
 #### Phase 2: Device Ingestion & Durable Local Storage (Hours 9 – 17)
 * **Time:** Oct 15, 01:30 – 09:30 IST
