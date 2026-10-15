@@ -10,6 +10,12 @@ import argparse
 import json
 import sys
 from pathlib import Path
+
+# Ensure workspace root is in sys.path when invoked directly as a script
+_root = str(Path(__file__).resolve().parent.parent)
+if _root not in sys.path:
+    sys.path.insert(0, _root)
+
 from biosignal_mock.ground_truth import audit_export_against_ground_truth
 
 
