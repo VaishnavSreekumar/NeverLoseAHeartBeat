@@ -22,23 +22,27 @@ from biosignal_mock.ground_truth import (
 
 
 def test_clean_export_auditing() -> None:
-    """Verifies that an export matching ground truth 100% passes as clean."""
+    """Verifies that an exact Section 4 export matching ground truth 100% passes as clean."""
     gt_lines = [
         json.dumps({"session_id": "s1", "sensor": 1, "index": 0, "values": [0, 1, 2]}),
         json.dumps({"session_id": "s1", "sensor": 1, "index": 1, "values": [3, 4, 5]}),
         json.dumps({"session_id": "s1", "sensor": 2, "index": 0, "values": [0, 1]}),
     ]
+    # Exact Section 4 format: NO session_id on exported samples
     export_lines = [
-        json.dumps({"session_id": "s1", "sensor": 1, "index": 0, "values": [0, 1, 2]}),
-        json.dumps({"session_id": "s1", "sensor": 1, "index": 1, "values": [3, 4, 5]}),
-        json.dumps({"session_id": "s1", "sensor": 2, "index": 0, "values": [0, 1]}),
+        json.dumps({"sensor": 1, "index": 0, "values": [0, 1, 2]}),
+        json.dumps({"sensor": 1, "index": 1, "values": [3, 4, 5]}),
+        json.dumps({"sensor": 2, "index": 0, "values": [0, 1]}),
     ]
 
     report = audit_export_against_ground_truth(gt_lines, export_lines)
     assert report.is_clean is True
+    assert report.total_ground_truth == 3
+    assert report.total_exported == 3
     assert report.missing_samples == 0
     assert report.duplicate_samples == 0
     assert report.altered_samples == 0
+    assert report.extra_samples == 0
 
 
 def test_silent_loss_detection() -> None:
@@ -49,8 +53,8 @@ def test_silent_loss_detection() -> None:
         json.dumps({"session_id": "s1", "sensor": 1, "index": 2, "values": [6, 7, 8]}),
     ]
     export_lines = [
-        json.dumps({"session_id": "s1", "sensor": 1, "index": 0, "values": [0, 1, 2]}),
-        json.dumps({"session_id": "s1", "sensor": 1, "index": 2, "values": [6, 7, 8]}),
+        json.dumps({"sensor": 1, "index": 0, "values": [0, 1, 2]}),
+        json.dumps({"sensor": 1, "index": 2, "values": [6, 7, 8]}),
     ]
 
     report = audit_export_against_ground_truth(gt_lines, export_lines)
@@ -67,7 +71,7 @@ def test_explicit_loss_reconciliation() -> None:
         json.dumps({"session_id": "s1", "sensor": 1, "index": 2, "values": [6, 7, 8]}),
     ]
     export_lines = [
-        json.dumps({"session_id": "s1", "sensor": 1, "index": 0, "values": [0, 1, 2]}),
+        json.dumps({"sensor": 1, "index": 0, "values": [0, 1, 2]}),
         # Loss record covering index 1 to 2
         json.dumps({"sensor": 1, "from_index": 1, "to_index": 2, "reason": "buffer_overflow"}),
     ]
@@ -84,9 +88,9 @@ def test_duplicate_sample_detection() -> None:
         json.dumps({"session_id": "s1", "sensor": 1, "index": 1, "values": [3, 4, 5]}),
     ]
     export_lines = [
-        json.dumps({"session_id": "s1", "sensor": 1, "index": 0, "values": [0, 1, 2]}),
-        json.dumps({"session_id": "s1", "sensor": 1, "index": 0, "values": [0, 1, 2]}),  # Duplicate!
-        json.dumps({"session_id": "s1", "sensor": 1, "index": 1, "values": [3, 4, 5]}),
+        json.dumps({"sensor": 1, "index": 0, "values": [0, 1, 2]}),
+        json.dumps({"sensor": 1, "index": 0, "values": [0, 1, 2]}),  # Duplicate!
+        json.dumps({"sensor": 1, "index": 1, "values": [3, 4, 5]}),
     ]
 
     report = audit_export_against_ground_truth(gt_lines, export_lines)
@@ -101,13 +105,55 @@ def test_altered_value_detection() -> None:
         json.dumps({"session_id": "s1", "sensor": 1, "index": 0, "values": [0, 1, 2]}),
     ]
     export_lines = [
-        json.dumps({"session_id": "s1", "sensor": 1, "index": 0, "values": [0, 9999, 2]}),  # Corrupted!
+        json.dumps({"sensor": 1, "index": 0, "values": [0, 9999, 2]}),  # Corrupted!
     ]
 
     report = audit_export_against_ground_truth(gt_lines, export_lines)
     assert report.is_clean is False
     assert report.altered_samples == 1
     assert any("CORRUPTION DEFECT" in d for d in report.defects)
+
+
+def test_extra_sample_detection() -> None:
+    """Verifies that invented/phantom samples not in ground truth are flagged."""
+    gt_lines = [
+        json.dumps({"session_id": "s1", "sensor": 1, "index": 0, "values": [0, 1, 2]}),
+    ]
+    export_lines = [
+        json.dumps({"sensor": 1, "index": 0, "values": [0, 1, 2]}),
+        json.dumps({"sensor": 1, "index": 1, "values": [3, 4, 5]}),  # Invented!
+    ]
+
+    report = audit_export_against_ground_truth(gt_lines, export_lines)
+    assert report.is_clean is False
+    assert report.extra_samples == 1
+    assert any("EXTRA SAMPLE DEFECT" in d for d in report.defects)
+
+
+def test_multi_session_resolution() -> None:
+    """Verifies multi-session ground truth handling and disambiguation."""
+    gt_lines = [
+        json.dumps({"session_id": "sess_A", "sensor": 1, "index": 0, "values": [10, 20, 30]}),
+        json.dumps({"session_id": "sess_B", "sensor": 1, "index": 0, "values": [90, 80, 70]}),
+    ]
+    export_a = [
+        json.dumps({"sensor": 1, "index": 0, "values": [10, 20, 30]}),
+    ]
+
+    # Without explicit session: ambiguity detected
+    report_ambiguous = audit_export_against_ground_truth(gt_lines, export_a)
+    assert report_ambiguous.is_clean is False
+    assert any("SESSION AMBIGUITY" in d for d in report_ambiguous.defects)
+
+    # With explicit target session: cleanly passes
+    report_a = audit_export_against_ground_truth(gt_lines, export_a, session_id="sess_A")
+    assert report_a.is_clean is True
+    assert report_a.total_ground_truth == 1
+
+    # With non-existent session: flagged
+    report_missing = audit_export_against_ground_truth(gt_lines, export_a, session_id="sess_Z")
+    assert report_missing.is_clean is False
+    assert any("SESSION NOT FOUND" in d for d in report_missing.defects)
 
 
 def test_live_ground_truth_tap_recording() -> None:

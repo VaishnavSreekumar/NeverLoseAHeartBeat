@@ -23,6 +23,7 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="Candidate Independent Ground-Truth Auditor")
     parser.add_argument("--ground-truth", required=True, help="Path to ground_truth.ndjson")
     parser.add_argument("--export", required=True, help="Path to pipeline export NDJSON")
+    parser.add_argument("--session", default=None, help="Target session ID to audit (optional if ground truth has only one session)")
     args = parser.parse_args()
 
     gt_path = Path(args.ground_truth)
@@ -36,7 +37,7 @@ def main() -> None:
         sys.exit(2)
 
     with open(gt_path, "r", encoding="utf-8") as f_gt, open(export_path, "r", encoding="utf-8") as f_exp:
-        report = audit_export_against_ground_truth(f_gt, f_exp)
+        report = audit_export_against_ground_truth(f_gt, f_exp, session_id=args.session)
 
     print(json.dumps(report.to_dict(), indent=2))
 
