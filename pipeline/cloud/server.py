@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 from pathlib import Path
 from typing import Any, Optional
 
@@ -273,3 +274,14 @@ def create_cloud_app(
         return Response(content=content, media_type="application/x-ndjson")
 
     return app
+
+
+# Default ASGI application instance configured via environment variable
+app = create_cloud_app(db_path=os.environ.get("CLOUD_DB_PATH", "biosignal_cloud.db"))
+
+
+if __name__ == "__main__":
+    import uvicorn
+    host = os.environ.get("HOST", "127.0.0.1")
+    port = int(os.environ.get("PORT", "8000"))
+    uvicorn.run("pipeline.cloud.server:app", host=host, port=port, reload=False)
