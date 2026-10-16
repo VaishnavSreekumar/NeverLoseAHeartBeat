@@ -13,11 +13,12 @@ The system continuously acquires high-frequency biosignals from two independent 
 Pursuant to Section 5 of the MayaCardio assessment brief:
 
 1. **[Installation & Run Guide](docs/RUN_GUIDE.md):** Complete step-by-step instructions to install, run, and benchmark on a fresh board.
-2. **[Engineering Design Note (2 Pages)](docs/DESIGN_NOTE.md):** Architectural design, formal guarantees vs non-guarantees, and mathematical derivation of maximum data loss on a power cut ($\le 250\text{ ms}$).
-3. **[Failure Test Evidence Report](docs/FAILURE_EVIDENCE.md):** Test results, logs, and coverage across all 186 test cases covering process kills (`SIGKILL`), power loss, network severance, CRC corruption, and conflicting duplicates.
+2. **[Engineering Design Note (2 Pages)](docs/DESIGN_NOTE.md):** Architectural design, formal guarantees vs non-guarantees, and mathematical derivation of maximum data loss on process crash ($\le 250\text{ ms}$) vs power cut.
+3. **[Failure Test Evidence Report](docs/FAILURE_EVIDENCE.md):** Test results, logs, and coverage across all 189 test cases covering process kills (`SIGKILL`), power loss, network severance, CRC corruption, and conflicting duplicates.
 4. **[Resource Measurements & ARM64 Audit](docs/RESOURCE_MEASUREMENTS.md):** Empirical measurements over 1-hour online mode (average CPU $52.36\%$, peak memory $84.28\text{ MB}$, network $51.09\text{ MB/hr}$) and ARM64 Raspberry Pi 4 compliance analysis.
 5. **[5-Minute Video Demonstration Script](docs/DEMO_GUIDE.md):** Timed storyboard, exact commands, and screen actions demonstrating network cut, process kill, and power-cut recovery.
 6. **[AI Tools & Methodology Disclosure](docs/AI_DISCLOSURE.md):** Formal disclosure of AI tools utilized and engineering quality controls enforced.
+7. **[ARM64 Linux Validation Report](docs/ARM64_VALIDATION.md):** Empirical validation running in an emulated ARM64 Linux container (4 CPU cores, 2 GB RAM bounds), 118 container tests, live streaming telemetry, and zero-backlog cloud reconciliation.
 
 ---
 
@@ -64,7 +65,7 @@ biosignal-assessment/
 │   ├── phase4c_catchup_summary.json    # 2-hour backlog catch-up measurement data
 │   └── resource_profile_summary.json   # 1-hour online resource profiling data
 │
-├── tests/                              # Automated test suite (186 passing tests)
+├── tests/                              # Automated test suite (189 passing tests)
 │   ├── test_phase4c_recovery.py        # Catch-up SLA, crash recovery, and clock skew tests
 │   ├── test_sync.py                    # Cloud replication, network cut, auto-switching tests
 │   ├── test_cloud.py                   # Cloud idempotent ingestion & cursor invariant tests
@@ -79,7 +80,8 @@ biosignal-assessment/
     ├── FAILURE_EVIDENCE.md             # Failure test suite evidence and logs
     ├── RESOURCE_MEASUREMENTS.md        # 1-hour resource profiling and ARM64 compliance audit
     ├── DEMO_GUIDE.md                   # 5-minute video demonstration script
-    └── AI_DISCLOSURE.md                # AI tools & methodology disclosure
+    ├── AI_DISCLOSURE.md                # AI tools & methodology disclosure
+    └── ARM64_VALIDATION.md             # ARM64 Linux container empirical validation report
 ```
 
 ---
@@ -104,7 +106,7 @@ pip install -e .
 ```bash
 pytest -v
 ```
-*Expected: 186 passed in ~35 seconds (100% pass rate).*
+*Expected: 189 passed in ~30 seconds (100% pass rate).*
 
 ### 3. Run Pipeline CLI Commands
 ```bash

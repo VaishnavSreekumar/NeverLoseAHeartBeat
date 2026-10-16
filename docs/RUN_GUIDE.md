@@ -99,7 +99,7 @@ pipeline results --session <SESSION_ID> --db biosignal_pipeline.db --output resu
 
 ## 4. Running the Complete Verification Suite
 
-Execute the entire automated test suite (186 comprehensive unit, durability, protocol, processing, cloud, sync, and recovery tests):
+Execute the entire automated test suite (189 comprehensive unit, durability, protocol, processing, cloud, sync, and recovery tests):
 
 ```bash
 pytest -v
@@ -107,7 +107,7 @@ pytest -v
 
 Expected result:
 ```
-186 passed in ~35s (100% pass rate)
+189 passed in ~30s (100% pass rate)
 ```
 
 ---

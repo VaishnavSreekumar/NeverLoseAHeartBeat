@@ -72,30 +72,52 @@ The MayaCardio pipeline is a fault-tolerant, edge-to-cloud biosignal streaming a
 
 ---
 
-## 3. Maximum Data Loss on a Power Cut, and Why
+## 3. Maximum Data Loss on Process Crash vs. Physical Power Cut
 
-### Theoretical Upper Bound:
+### A. Process Crash Failure Mode (`SIGKILL`, OOM, Runtime Exception)
+
+#### Formal Durability Bound:
 $$\Delta t_{\text{loss}} \le 250\text{ ms} \quad (\le 100\text{ samples per sensor} = 200\text{ samples total})$$
 
-### Mathematical & Architectural Derivation:
-
-1. **Ingestion Micro-Batching Window:**  
-   The `StorageIngestionWorker` accumulates incoming sensor frames in memory and flushes them to SQLite either when the batch size reaches 400 samples or when the flush timer expires:
+#### Derivation & Proof:
+1. **Ingestion Micro-Batching Buffer:**  
+   The `StorageIngestionWorker` accumulates incoming sensor frames in volatile memory and commits them to SQLite in atomic batches either when the batch reaches 400 samples or when the flush timer expires:
    $$\tau_{\text{flush}} = 250\text{ ms}$$
-   At nominal sampling rate ($400\text{ Hz}$ per sensor), $250\text{ ms}$ corresponds to exactly:
+   At nominal sampling rate ($400\text{ Hz}$ per sensor), $250\text{ ms}$ of uncommitted data equals:
    $$N_{\text{uncommitted}} = 400\text{ samples/sec} \times 0.25\text{ sec} = 100\text{ samples/sensor} \quad (200\text{ samples total})$$
 
-2. **SQLite Write-Ahead Logging (WAL) & Fsync Semantics:**  
-   The storage engine operates in SQLite `WAL` mode with `PRAGMA synchronous = NORMAL`. Under `NORMAL` synchronous mode in WAL, SQLite guarantees that:
-   - Transactions are flushed to the WAL file immediately upon `COMMIT`.
-   - The OS write cache for the WAL is periodically synchronized to non-volatile physical storage via `wal_checkpoint(TRUNCATE)` and explicit `fsync` calls during checkpoint events.
-   - Any transaction committed to the WAL is fully durable across process crashes (`SIGKILL`).
+2. **OS Kernel Page Cache Preservation:**  
+   In SQLite `WAL` mode with `PRAGMA synchronous = NORMAL`, transactions write dirty pages into the OS filesystem page cache upon `COMMIT`. If the userland application process abruptly crashes or receives `SIGKILL`, the Linux OS kernel remains alive and transparently flushes dirty page buffers to the physical block device. All committed WAL frames are preserved.
+   Therefore, data loss across any process crash is strictly bounded by the volatile in-memory accumulation buffer:
+   $$\text{Max Data Lost (Process Crash)} \le 250\text{ ms} \quad (200\text{ samples})$$
 
-3. **Power-Cut Failure Scenario (Hard Uncontrolled Power Severance):**  
-   In the event of an instantaneous physical power cut:
-   - **Committed Batches:** Any batch that has completed its SQLite `COMMIT` before the power cut is structurally protected by SQLite's WAL recovery protocol. Upon power restoration, SQLite replays the WAL log, recovering 100% of committed transactions with zero data loss or corruption.
-   - **In-Flight Batch:** Only the samples currently residing in volatile process RAM awaiting the next $250\text{ ms}$ flush tick can be lost. Therefore, the absolute maximum sample loss is strictly bounded by the accumulation window:
-     $$\text{Max Samples Lost} = 200 \text{ samples} \quad (250\text{ ms of acquisition})$$
+---
 
-4. **Post-Power-Cut Recovery Invariant:**  
-   Upon reboot, `reconstruct_authoritative_checkpoints()` inspects the durable database, identifies the highest contiguous persisted index, queries the mock server or records an authoritative `power_cut` loss interval for any gap, and resumes streaming without index ambiguity or data corruption.
+### B. Sudden Physical Power Cut (Catastrophic DC Power Severance)
+
+#### Durability Guarantees vs. Non-Guarantees:
+
+1. **Guaranteed Structural Integrity (Zero Corruption):**  
+   Under SQLite WAL mode with `PRAGMA synchronous = NORMAL`, transactions committed to the WAL are protected by 32-bit checksums in each frame header. SQLite guarantees that even under an instantaneous power cut during a write, the database **will never become corrupted**. Upon reboot, SQLite detects any torn or incomplete WAL frames, discards them cleanly, and restores the database to a valid, internally consistent transaction boundary.
+
+2. **Durability Boundary Under `PRAGMA synchronous = NORMAL`:**  
+   Under `synchronous = NORMAL` in WAL mode, SQLite syncs the WAL to non-volatile physical storage during `wal_checkpoint` operations (or when the WAL reaches the auto-checkpoint threshold of 1,000 pages). SQLite does **not** invoke a synchronous blocking `fsync()` system call on the WAL file on every micro-batch commit.  
+   If DC power to the edge board is instantaneously severed while dirty WAL pages reside solely in the Linux kernel dirty page cache:
+   - Consumer MicroSD cards lack hardware Power-Loss Protection (PLP) write caches.
+   - Un-fsynced committed transactions residing only in volatile system RAM will not persist to NAND flash.
+   - Upon power restoration, the database safely rolls back to the last fsynced WAL checkpoint boundary.
+
+3. **Engineering Trade-off & Hardware Prerequisites:**  
+   To achieve strict physical power-cut durability down to $\le 250\text{ ms}$ on physical edge hardware:
+   - **Software Option:** Configure `PRAGMA synchronous = FULL` or `EXTRA`. This executes an explicit `fsync()` on the WAL file on every 250ms batch commit. *Trade-off:* High synchronous write latency and accelerated flash wear on consumer MicroSD media.
+   - **Hardware Recommended Option:** Deploy an embedded hardware Supercapacitor / Uninterruptible Power Supply (e.g., PiJuice / UPS HAT) that asserts a GPIO interrupt (`SIGPWR`) upon input power drop, providing $\ge 2.0\text{ seconds}$ of clean power to execute `PRAGMA wal_checkpoint(TRUNCATE)` before system shutdown.
+
+---
+
+### C. Post-Reboot Recovery Invariant
+
+Upon system restart (after either a process crash or power cut):
+1. `StorageEngine.reconstruct_authoritative_checkpoints()` inspects the durable database, reads the highest contiguous persisted sample index per sensor, and identifies any gap in index space.
+2. The pipeline authoritatively records an immutable `system_restart` loss record in the database for missing indices.
+3. The pipeline queries the sensor daemon starting from the next expected index.
+4. No duplicate samples, phantom records, or silent data corruptions can ever occur.

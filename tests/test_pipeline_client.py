@@ -97,28 +97,23 @@ async def test_client_malformed_reply_handling() -> None:
 
     # Custom mini TCP server sending malformed frames followed by valid frame
     async def malformed_handler(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
-        while True:
+        valid_reply = format_mock_reply(
+            session_id="test_sess",
+            sensor=1,
+            first_index=0,
+            data=[[10, 20, 30]],
+        )
+        replies = [
+            b"NOT_VALID_JSON_AT_ALL\n",
+            b'{"invalid_schema": true}\n',
+            valid_reply.encode("utf-8"),
+        ]
+        for reply in replies:
             line = await reader.readline()
             if not line:
                 break
-            # First send unparseable garbage
-            writer.write(b"NOT_VALID_JSON_AT_ALL\n")
+            writer.write(reply)
             await writer.drain()
-
-            # Next send JSON missing required fields
-            writer.write(b'{"invalid_schema": true}\n')
-            await writer.drain()
-
-            # Finally send a valid NDJSON frame
-            valid_reply = format_mock_reply(
-                session_id="test_sess",
-                sensor=1,
-                first_index=0,
-                data=[[10, 20, 30]],
-            )
-            writer.write(valid_reply.encode("utf-8"))
-            await writer.drain()
-            break
         writer.close()
         await writer.wait_closed()
 

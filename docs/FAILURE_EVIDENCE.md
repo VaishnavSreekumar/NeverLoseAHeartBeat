@@ -6,8 +6,8 @@ This document compiles empirical evidence and execution results from the compreh
 
 ## 1. Automated Test Suite Summary Baseline
 
-- **Total Test Cases Collected:** 186
-- **Total Test Cases Passed:** 186 (100% pass rate)
+- **Total Test Cases Collected:** 189
+- **Total Test Cases Passed:** 189 (100% pass rate)
 - **Total Test Cases Failed:** 0
 - **Total Test Cases Skipped:** 0
 - **Execution Environment:** Windows 11 / Linux (Python 3.12 / 3.13)
@@ -17,8 +17,8 @@ This document compiles empirical evidence and execution results from the compreh
 | Test Module | Tests | Primary Failure Scenarios Validated | Status |
 | :--- | :---: | :--- | :---: |
 | `tests/test_phase4c_recovery.py` | 7 | 2-Hr Catch-Up SLA, Cloud Crash/Restart, Client Kill/Restart, Clock Skew, Conflicts | **PASS** |
-| `tests/test_sync.py` | 11 | Network Outage Auto-Switch ($\le 10$s), Response Loss, Duplicate Retries, Multi-Session | **PASS** |
-| `tests/test_cloud.py` | 29 | Cloud Cursor Invariants, Idempotency, Open-Ended Loss Closure, Window Recomputation | **PASS** |
+| `tests/test_sync.py` | 12 | Network Outage Auto-Switch ($\le 10$s), Response Loss, Duplicate Retries, Multi-Session | **PASS** |
+| `tests/test_cloud.py` | 31 | Cloud Cursor Invariants, Idempotency, Open-Ended Loss Closure, Window Recomputation | **PASS** |
 | `tests/test_validation_increment_d.py`| 20 | Process Crash (`SIGKILL`), Power-Loss Simulation, Conflicting Duplicates, Torn Batches | **PASS** |
 | `tests/test_storage.py` | 18 | SQLite WAL Durability, Checkpoint Reconstruction ($<100$ms), Loss-Ledger Integrity | **PASS** |
 | `tests/test_processing.py` | 28 | Section 3 Window Completeness, Missing Counts, 4-Condition ECG Peak Detector | **PASS** |
@@ -31,7 +31,7 @@ This document compiles empirical evidence and execution results from the compreh
 | `tests/test_server.py` | 8 | Multi-Client Isolation, Port Re-binding, Graceful Termination | **PASS** |
 | `tests/test_signal.py` | 4 | Synthetic ECG (3 ch) & PPG (2 ch) Waveform Validation | **PASS** |
 | `tests/test_ramp.py` | 5 | Ramp Mode Monotonic Counter Integrity & Wraparound | **PASS** |
-| **Total** | **186** | **All Invariants Empirically Verified** | **100% PASS** |
+| **Total** | **189** | **All Invariants Empirically Verified** | **100% PASS** |
 
 ---
 
