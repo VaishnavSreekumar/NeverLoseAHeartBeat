@@ -406,6 +406,21 @@ def test_cli_status_with_cloud_integration(
     assert st3["samples_in_cloud"] == 100
     assert st3["backlog"] == 200
 
+    # 5. Status when authentication is enabled on cloud receiver
+    monkeypatch.setenv("CLOUD_API_KEY", "cli-test-secret")
+    # Without api key -> cloud probe returns 401, falls back to offline
+    code = main(["status", "--db", str(local_db), "--cloud-url", "http://localhost:8000"])
+    assert code == 0
+    st4 = json.loads(capsys.readouterr().out.strip())
+    assert st4["mode"] == "offline"
+
+    # With correct --api-key -> succeeds with online mode
+    code = main(["status", "--db", str(local_db), "--cloud-url", "http://localhost:8000", "--api-key", "cli-test-secret"])
+    assert code == 0
+    st5 = json.loads(capsys.readouterr().out.strip())
+    assert st5["mode"] == "online"
+    assert st5["samples_in_cloud"] == 100
+
     cloud_storage.close()
 
 

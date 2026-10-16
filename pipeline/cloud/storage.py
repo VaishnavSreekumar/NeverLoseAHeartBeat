@@ -897,15 +897,21 @@ class CloudStorageEngine:
             finally:
                 cursor.close()
 
-    def get_counts(self) -> tuple[int, int]:
-        """Return total (samples_count, loss_records_count)."""
+    def get_counts(self, session_id: Optional[str] = None) -> tuple[int, int]:
+        """Return total (samples_count, loss_records_count), optionally filtered by session_id."""
         with self._lock:
             cursor = self._conn.cursor()
             try:
-                cursor.execute("SELECT COUNT(*) AS c FROM samples;")
-                samp_cnt = cursor.fetchone()["c"]
-                cursor.execute("SELECT COUNT(*) AS c FROM loss_ledger;")
-                loss_cnt = cursor.fetchone()["c"]
+                if session_id:
+                    cursor.execute("SELECT COUNT(*) AS c FROM samples WHERE session_id = ?;", (session_id,))
+                    samp_cnt = cursor.fetchone()["c"]
+                    cursor.execute("SELECT COUNT(*) AS c FROM loss_ledger WHERE session_id = ?;", (session_id,))
+                    loss_cnt = cursor.fetchone()["c"]
+                else:
+                    cursor.execute("SELECT COUNT(*) AS c FROM samples;")
+                    samp_cnt = cursor.fetchone()["c"]
+                    cursor.execute("SELECT COUNT(*) AS c FROM loss_ledger;")
+                    loss_cnt = cursor.fetchone()["c"]
                 return samp_cnt, loss_cnt
             finally:
                 cursor.close()

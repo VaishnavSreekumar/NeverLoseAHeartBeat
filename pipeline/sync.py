@@ -15,6 +15,7 @@ Responsible for:
 from __future__ import annotations
 
 import logging
+import os
 import threading
 import time
 from dataclasses import dataclass
@@ -59,6 +60,7 @@ class CloudSyncWorker:
         http_timeout: float = 3.0,
         offline_threshold_s: float = 10.0,
         client: Optional[httpx.Client] = None,
+        api_key: Optional[str] = None,
     ) -> None:
         self.storage = storage
         self.cloud_url = cloud_url.rstrip("/")
@@ -68,6 +70,7 @@ class CloudSyncWorker:
         self.health_interval = health_interval
         self.http_timeout = http_timeout
         self.offline_threshold_s = offline_threshold_s
+        self.api_key = api_key or os.environ.get("PIPELINE_API_KEY")
 
         self._client = client or httpx.Client(timeout=self.http_timeout)
         self._owns_client = client is None
@@ -83,6 +86,13 @@ class CloudSyncWorker:
         self._last_health_check_time: float = 0.0
 
         self.telemetry = SyncTelemetry()
+
+    def _get_headers(self) -> dict[str, str]:
+        """Construct HTTP headers including authentication if configured."""
+        headers: dict[str, str] = {}
+        if self.api_key:
+            headers["X-API-Key"] = self.api_key
+        return headers
 
     @property
     def mode(self) -> str:
@@ -113,7 +123,7 @@ class CloudSyncWorker:
         now = time.time()
         self._last_health_check_time = now
         try:
-            resp = self._client.get(f"{self.cloud_url}/api/v1/status")
+            resp = self._client.get(f"{self.cloud_url}/api/v1/status", headers=self._get_headers())
             if resp.status_code == 200:
                 with self._lock:
                     self._consecutive_failure_start = None
@@ -182,6 +192,7 @@ class CloudSyncWorker:
             resp = self._client.post(
                 f"{self.cloud_url}/api/v1/ingest/batch",
                 json=payload,
+                headers=self._get_headers(),
             )
         except Exception as exc:
             self._record_network_failure(f"HTTP POST failed for batch {batch.sensor}@{batch.first_index}: {exc}")

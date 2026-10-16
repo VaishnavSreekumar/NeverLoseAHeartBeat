@@ -1364,3 +1364,102 @@ def test_cloud_batch_count_and_extra_fields_validation(cloud_client: TestClient)
     assert "Extra inputs are not permitted" in r4.text
 
 
+def test_cloud_status_session_filtering(tmp_path: Path) -> None:
+    """Verify /api/v1/status filters counts and checkpoints when ?session= is supplied."""
+    storage = CloudStorageEngine(tmp_path / "filter_test.db")
+    app = create_cloud_app(storage=storage)
+    client = TestClient(app)
+
+    # Ingest 100 samples for session A
+    b_a = {
+        "session_id": "sess_A",
+        "sensor": 1,
+        "first_index": 0,
+        "count": 100,
+        "data": [[i, i, i] for i in range(100)],
+        "lost": [],
+        "session_end": False,
+    }
+    client.post("/api/v1/ingest/batch", json=b_a)
+
+    # Ingest 200 samples for session B
+    b_b = {
+        "session_id": "sess_B",
+        "sensor": 1,
+        "first_index": 0,
+        "count": 200,
+        "data": [[i, i, i] for i in range(200)],
+        "lost": [],
+        "session_end": False,
+    }
+    client.post("/api/v1/ingest/batch", json=b_b)
+
+    # Global status: returns 300 samples
+    res_global = client.get("/api/v1/status").json()
+    assert res_global["total_samples"] == 300
+    assert len(res_global["checkpoints"]) == 2
+
+    # Filtered by session A: returns 100 samples
+    res_a = client.get("/api/v1/status", params={"session": "sess_A"}).json()
+    assert res_a["total_samples"] == 100
+    assert len(res_a["checkpoints"]) == 1
+    assert res_a["checkpoints"][0]["session_id"] == "sess_A"
+
+    # Filtered by session B: returns 200 samples
+    res_b = client.get("/api/v1/status", params={"session": "sess_B"}).json()
+    assert res_b["total_samples"] == 200
+    assert len(res_b["checkpoints"]) == 1
+    assert res_b["checkpoints"][0]["session_id"] == "sess_B"
+
+    # Filtered by nonexistent session: returns 0 samples
+    res_c = client.get("/api/v1/status", params={"session": "sess_nonexistent"}).json()
+    assert res_c["total_samples"] == 0
+    assert len(res_c["checkpoints"]) == 0
+
+    storage.close()
+
+
+def test_cloud_api_key_authentication_enforcement(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Verify that setting CLOUD_API_KEY blocks unauthenticated access and accepts matching keys."""
+    storage = CloudStorageEngine(tmp_path / "auth_test.db")
+    app = create_cloud_app(storage=storage)
+    client = TestClient(app)
+
+    # 1. Without CLOUD_API_KEY set: requests succeed with HTTP 200
+    r_open = client.get("/api/v1/status")
+    assert r_open.status_code == 200
+
+    # 2. Configure secret key in environment
+    monkeypatch.setenv("CLOUD_API_KEY", "secret-test-token-12345")
+
+    # 3. Request without key is rejected with HTTP 401
+    r_no_key = client.get("/api/v1/status")
+    assert r_no_key.status_code == 401
+    assert "Invalid or missing API key" in r_no_key.json()["detail"]
+
+    # 4. Request with wrong key is rejected with HTTP 401
+    r_bad_key = client.get("/api/v1/status", headers={"X-API-Key": "wrong-key"})
+    assert r_bad_key.status_code == 401
+
+    # 5. Request with matching X-API-Key header succeeds with HTTP 200
+    r_good_x = client.get("/api/v1/status", headers={"X-API-Key": "secret-test-token-12345"})
+    assert r_good_x.status_code == 200
+
+    # 6. Request with matching Authorization Bearer header succeeds with HTTP 200
+    r_good_bearer = client.get("/api/v1/status", headers={"Authorization": "Bearer secret-test-token-12345"})
+    assert r_good_bearer.status_code == 200
+
+    # 7. POST ingest with key succeeds
+    b = {
+        "session_id": "auth_sess",
+        "sensor": 1,
+        "first_index": 0,
+        "count": 10,
+        "data": [[1, 2, 3]] * 10,
+        "lost": [],
+        "session_end": False,
+    }
+    r_post_auth = client.post("/api/v1/ingest/batch", json=b, headers={"X-API-Key": "secret-test-token-12345"})
+    assert r_post_auth.status_code == 200
+
+    storage.close()

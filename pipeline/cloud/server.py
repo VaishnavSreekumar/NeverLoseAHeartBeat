@@ -16,7 +16,7 @@ import os
 from pathlib import Path
 from typing import Any, Optional
 
-from fastapi import FastAPI, HTTPException, Query, Response, status
+from fastapi import Depends, FastAPI, Header, HTTPException, Query, Response, status
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 from pipeline.cloud.service import CloudProcessingService
@@ -119,6 +119,34 @@ class BatchResponse(BaseModel):
 # FastAPI Application Factory
 # ==============================================================================
 
+def verify_api_key(
+    x_api_key: Optional[str] = Header(None, alias="X-API-Key"),
+    authorization: Optional[str] = Header(None, alias="Authorization"),
+) -> None:
+    """Optional authentication check.
+
+    If CLOUD_API_KEY environment variable is configured, requests must provide a
+    matching key via 'X-API-Key' header or 'Authorization: Bearer <key>'.
+    If CLOUD_API_KEY is unset or empty, authentication is disabled (local/test mode).
+    """
+    expected = os.environ.get("CLOUD_API_KEY")
+    if not expected:
+        return
+
+    provided = x_api_key
+    if not provided and authorization:
+        parts = authorization.split(" ", 1)
+        if len(parts) == 2 and parts[0].lower() == "bearer":
+            provided = parts[1]
+
+    if not provided or provided != expected:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Unauthorized: Invalid or missing API key",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+
+
 def create_cloud_app(
     db_path: str | Path = "biosignal_cloud.db",
     storage: Optional[CloudStorageEngine] = None,
@@ -128,6 +156,7 @@ def create_cloud_app(
         title="MayaCardio Cloud Biosignal Receiver",
         description="Durable cloud receiver and Section 3 online signal processing service.",
         version="0.1.0",
+        dependencies=[Depends(verify_api_key)],
     )
 
     if storage is None:
@@ -209,13 +238,16 @@ def create_cloud_app(
         status_code=status.HTTP_200_OK,
         summary="Get cloud receiver status",
     )
-    def get_status() -> dict[str, Any]:
+    def get_status(
+        session: Optional[str] = Query(None, description="Optional session ID to filter status"),
+    ) -> dict[str, Any]:
         """Return system health, active sessions, counts, and stream checkpoints."""
-        samp_cnt, loss_cnt = storage.get_counts()
-        checkpoints = storage.get_all_checkpoints()
+        samp_cnt, loss_cnt = storage.get_counts(session_id=session)
+        checkpoints = storage.get_all_checkpoints(session_id=session)
         return {
             "status": "healthy",
             "active_sessions": storage.get_active_sessions(),
+            "session_id": session,
             "total_samples": samp_cnt,
             "total_loss_records": loss_cnt,
             "checkpoints": [

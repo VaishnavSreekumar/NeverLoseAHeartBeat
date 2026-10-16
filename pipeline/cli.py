@@ -55,6 +55,7 @@ def cmd_status(args: argparse.Namespace) -> int:
     cloud_url = getattr(args, "cloud_url", None) or os.environ.get("PIPELINE_CLOUD_URL", "http://localhost:8000")
 
     samples_saved = 0
+    device_sessions: list[str] = []
     local_replicated_samples: Optional[int] = None
     local_backlog: Optional[int] = None
 
@@ -69,6 +70,8 @@ def cmd_status(args: argparse.Namespace) -> int:
                 if cursor.fetchone():
                     cursor.execute("SELECT COUNT(*) FROM samples;")
                     samples_saved = cursor.fetchone()[0]
+                    cursor.execute("SELECT DISTINCT session_id FROM samples ORDER BY rowid DESC;")
+                    device_sessions = [r[0] for r in cursor.fetchall()]
 
                 cursor.execute(
                     "SELECT name FROM sqlite_master WHERE type='table' AND name='cloud_checkpoints';"
@@ -88,13 +91,19 @@ def cmd_status(args: argparse.Namespace) -> int:
         except sqlite3.Error as exc:
             sys.stderr.write(f"Warning: Error querying database '{db_path}': {exc}\n")
 
+    api_key = getattr(args, "api_key", None) or os.environ.get("PIPELINE_API_KEY")
+    headers = {"X-API-Key": api_key} if api_key else {}
+
     # Probe cloud receiver
     cloud_healthy = False
     cloud_sample_count: Optional[int] = None
     try:
         import httpx
         with httpx.Client(timeout=1.0) as client:
-            resp = client.get(f"{cloud_url.rstrip('/')}/api/v1/status")
+            params = {}
+            if len(device_sessions) == 1:
+                params["session"] = device_sessions[0]
+            resp = client.get(f"{cloud_url.rstrip('/')}/api/v1/status", params=params, headers=headers)
             if resp.status_code == 200:
                 cloud_healthy = True
                 c_data = resp.json()
@@ -140,10 +149,16 @@ def cmd_export(args: argparse.Namespace) -> int:
 
     if source == "cloud":
         cloud_url = getattr(args, "cloud_url", None) or os.environ.get("PIPELINE_CLOUD_URL", "http://localhost:8000")
+        api_key = getattr(args, "api_key", None) or os.environ.get("PIPELINE_API_KEY")
+        headers = {"X-API-Key": api_key} if api_key else {}
         try:
             import httpx
             with httpx.Client(timeout=10.0) as client:
-                resp = client.get(f"{cloud_url.rstrip('/')}/api/v1/export", params={"session": session_id})
+                resp = client.get(
+                    f"{cloud_url.rstrip('/')}/api/v1/export",
+                    params={"session": session_id},
+                    headers=headers,
+                )
                 if resp.status_code == 200:
                     content = resp.text
                     lines = [ln for ln in content.strip().splitlines() if ln]
@@ -343,6 +358,12 @@ def build_parser() -> argparse.ArgumentParser:
         default=None,
         help="URL of the cloud receiver service",
     )
+    p_status.add_argument(
+        "--api-key",
+        dest="api_key",
+        default=None,
+        help="API key for authenticated cloud receiver",
+    )
     p_status.set_defaults(func=cmd_status)
 
     # 2. pipeline export --session <ID> --from [device|cloud]
@@ -373,6 +394,12 @@ def build_parser() -> argparse.ArgumentParser:
         dest="cloud_url",
         default=None,
         help="URL of the cloud receiver service",
+    )
+    p_export.add_argument(
+        "--api-key",
+        dest="api_key",
+        default=None,
+        help="API key for authenticated cloud receiver",
     )
     p_export.set_defaults(func=cmd_export)
 
