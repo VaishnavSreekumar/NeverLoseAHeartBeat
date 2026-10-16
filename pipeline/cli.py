@@ -108,7 +108,21 @@ def cmd_status(args: argparse.Namespace) -> int:
                 cloud_healthy = True
                 c_data = resp.json()
                 cloud_sample_count = c_data.get("total_samples", 0)
-    except Exception:
+            elif resp.status_code == 401:
+                sys.stderr.write(
+                    f"Warning: Cloud receiver at '{cloud_url}' returned HTTP 401 Unauthorized "
+                    "(invalid or missing API key). Falling back to offline mode.\n"
+                )
+            else:
+                sys.stderr.write(
+                    f"Warning: Cloud receiver at '{cloud_url}' returned HTTP {resp.status_code}. "
+                    "Falling back to offline mode.\n"
+                )
+    except Exception as exc:
+        sys.stderr.write(
+            f"Warning: Could not connect to cloud receiver at '{cloud_url}': {exc}. "
+            "Falling back to offline mode.\n"
+        )
         cloud_healthy = False
 
     if cloud_healthy and cloud_sample_count is not None:

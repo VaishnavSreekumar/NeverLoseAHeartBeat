@@ -700,3 +700,81 @@ def test_sync_conflict_quarantine(tmp_path: Path) -> None:
 
     local_storage.close()
     cloud_storage.close()
+
+
+def test_cli_status_auth_regression_reproduction(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Regression test reproducing and validating the status reporting issue.
+
+    Scenario:
+    - Device DB has 5820 samples saved and stored cloud_checkpoints at index 2909 for both sensors (5820 replicated).
+    - Cloud DB has 5820 samples persisted for the session.
+    - Cloud receiver has CLOUD_API_KEY authentication enabled.
+    - An unauthenticated status check receives HTTP 401:
+      * mode remains 'offline' (not forced to online despite sample count equality).
+      * samples_in_cloud reports 5820 from local checkpoints.
+      * backlog reports 0.
+      * stderr clearly warns about the 401 Unauthorized probe failure.
+    - When authenticated with --api-key, mode transitions to 'online'.
+    """
+    local_db = tmp_path / "repro_device.db"
+    cloud_db = tmp_path / "repro_cloud.db"
+
+    local_storage = create_local_storage(local_db)
+    cloud_storage = CloudStorageEngine(cloud_db)
+    app = create_cloud_app(storage=cloud_storage)
+
+    # Populate 2910 samples for sensor 1 and 2910 samples for sensor 2 (5820 total)
+    populate_device_samples(local_storage, "sess_repro", 1, start_index=0, count=2910)
+    populate_device_samples(local_storage, "sess_repro", 2, start_index=0, count=2910)
+
+    # Replicate both sensors to cloud to achieve sample_saved == samples_in_cloud (5820)
+    client = TestClient(app, base_url="http://testserver")
+    worker = CloudSyncWorker(
+        storage=local_storage,
+        cloud_url="http://testserver",
+        batch_size=500,
+        client=client,
+    )
+    worker.sync_all_pending()
+    assert worker.backlog == 0
+    local_storage.close()
+
+    # Enable API key authentication on the cloud receiver
+    monkeypatch.setenv("CLOUD_API_KEY", "repro-secret-auth-key-999")
+    monkeypatch.setattr("httpx.Client", lambda *args, **kwargs: TestClient(app, base_url="http://localhost:8000"))
+
+    # 1. Unauthenticated invocation: probe returns 401 -> mode is offline, samples_in_cloud from local checkpoint
+    code = main(["status", "--db", str(local_db), "--cloud-url", "http://localhost:8000"])
+    assert code == 0
+    captured = capsys.readouterr()
+    st_unauth = json.loads(captured.out.strip())
+
+    # Verify exact reproduction of user-observed output
+    assert st_unauth["mode"] == "offline"
+    assert st_unauth["samples_saved"] == 5820
+    assert st_unauth["samples_in_cloud"] == 5820
+    assert st_unauth["backlog"] == 0
+    # Verify stderr warning was emitted
+    assert "Warning: Cloud receiver at 'http://localhost:8000' returned HTTP 401 Unauthorized" in captured.err
+
+    # 2. Authenticated invocation: probe succeeds with 200 -> mode is online
+    code = main([
+        "status",
+        "--db", str(local_db),
+        "--cloud-url", "http://localhost:8000",
+        "--api-key", "repro-secret-auth-key-999",
+    ])
+    assert code == 0
+    captured_auth = capsys.readouterr()
+    st_auth = json.loads(captured_auth.out.strip())
+    assert st_auth["mode"] == "online"
+    assert st_auth["samples_saved"] == 5820
+    assert st_auth["samples_in_cloud"] == 5820
+    assert st_auth["backlog"] == 0
+
+    cloud_storage.close()
+
