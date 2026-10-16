@@ -1,0 +1,65 @@
+{
+  "timestamp": "2026-10-16T06:03:16Z",
+  "session_id": "714dcf49",
+  "mock_params": {
+    "mode": "signal",
+    "seed": 7,
+    "port": 7100
+  },
+  "phase2_online_initial": {
+    "mode": "online",
+    "backlog": 40,
+    "samples_replicated": 10850
+  },
+  "phase2_offline_outage": {
+    "severance_duration_s": 48.69015780001064,
+    "mode": "offline",
+    "backlog_accumulated": 37350,
+    "auto_switched_to_offline": true
+  },
+  "phase3_recovery": {
+    "mode_switch_time_s": 0.03267580000101589,
+    "backlog_drain_time_s": 31.63921919997665,
+    "final_mode": "online",
+    "final_backlog": 0
+  },
+  "reconciliation": {
+    "session_id": "0e57d043",
+    "total_device_samples": 76780,
+    "total_cloud_samples": 76780,
+    "total_device_losses": 0,
+    "total_cloud_losses": 0,
+    "sensor1": {
+      "device_count": 38390,
+      "cloud_count": 38390,
+      "index_range_dev": [
+        0,
+        38389
+      ],
+      "index_range_cld": [
+        0,
+        38389
+      ],
+      "missing_count": 0,
+      "duplicate_count": 0,
+      "extra_count": 0
+    },
+    "sensor2": {
+      "device_count": 38390,
+      "cloud_count": 38390,
+      "index_range_dev": [
+        0,
+        38389
+      ],
+      "index_range_cld": [
+        0,
+        38389
+      ],
+      "missing_count": 0,
+      "duplicate_count": 0,
+      "extra_count": 0
+    },
+    "value_mismatches": 0,
+    "perfect_parity": true
+  }
+}

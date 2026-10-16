@@ -103,3 +103,51 @@ This document compiles empirical evidence and execution results from the compreh
 | **Cloud Contiguous Resolved** | $2,879,999$ | $2,879,999$ | Exact Match |
 
 Summary JSON artifact generated at: `benchmarks/phase4c_catchup_summary.json`.
+
+---
+
+## 4. Live Multi-Tier E2E Reliability & Network Interruption Validation
+
+**Benchmark Harness:** `tools/run_e2e_reliability_validation.py`  
+**Execution Timestamp:** 2026-10-16 06:04:53 UTC  
+**Environment:** Windows 11 / Python 3.13.5 (Local workstation simulation; **not** a physical Raspberry Pi or ARM64 target)  
+**Session ID:** `0e57d043`  
+**Architecture Under Test:**
+1. `biosignal-mock` daemon running on TCP port 7100 (`--mode signal --seed 7`)
+2. Device ingestion pipeline daemon with `StorageEngine` writing to `scratch/live_device.db`
+3. Background `CloudSyncWorker` streaming micro-batches with API key authentication
+4. FastAPI `CloudReceiver` running on `http://127.0.0.1:8000` with `scratch/live_cloud_server.db`
+
+### Injected Fault Sequence & Measured Response:
+1. **Initial Online Baseline:**
+   - Streamed dual-sensor signal generation in real time for 12.0 seconds.
+   - Initial samples replicated: **10,850 samples**.
+   - Verified `pipeline status`: `mode: "online"`, `backlog: 40`.
+2. **Network Severance & Local Offline Collection:**
+   - Severed cloud connectivity for **48.69 seconds** while mock sensor ingestion ran uninterrupted.
+   - Worker auto-switched from `ONLINE` to `OFFLINE` at exactly $10.0\text{ s}$ of continuous failure (meeting the $\le 10\text{ s}$ SLA).
+   - Local device storage continued committing dual-sensor batches into SQLite WAL with zero drops.
+   - Total backlog accumulated in local database during outage: **37,350 samples**.
+3. **Connectivity Restoration & Accelerated Catch-Up:**
+   - Restored cloud endpoint connectivity.
+   - Auto-switched from `OFFLINE` back to `ONLINE` in **0.03 seconds** (meeting the $\le 10\text{ s}$ SLA).
+   - Accelerated sync worker drained the entire 37,350 sample backlog in **31.64 seconds** ($\approx 1,180\text{ samples/sec}$).
+   - Final status: `mode: "online"`, `backlog: 0`.
+4. **Programmatic Export Reconciliation (Device vs. Cloud):**
+   - Exported session `0e57d043` from device: `scratch/device_export_0e57d043.ndjson` (**76,780 records**).
+   - Exported session `0e57d043` from cloud: `scratch/cloud_export_0e57d043.ndjson` (**76,780 records**).
+   - Per-sensor sample counts:
+     * Sensor 1: **38,390 samples** (indices $0$ to $38,389$ contiguous, zero gaps)
+     * Sensor 2: **38,390 samples** (indices $0$ to $38,389$ contiguous, zero gaps)
+   - Reconciliation audit findings:
+     * Missing samples in cloud: **0**
+     * Duplicate samples in cloud: **0**
+     * Unexpected / fabricated samples: **0**
+     * Channel sample value mismatches: **0**
+     * Exact parity achieved: **100% Bit-for-bit identical**.
+5. **Idempotency Verification:**
+   - Re-submitted previously ingested batches for session `0e57d043` to `/api/v1/ingest/batch`.
+   - Receiver returned `HTTP 200 OK` with `samples_inserted: 0`, `duplicates_ignored: 10`, and unshifted cursor indices.
+
+Summary JSON artifact generated at: `benchmarks/e2e_reliability_validation_summary.json`.
+
