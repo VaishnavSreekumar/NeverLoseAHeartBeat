@@ -42,6 +42,8 @@ htmlcov/
 *.tmp
 raw_assessment_spec.txt
 scratch/
+.env
+*.env
 
 # IDE & OS
 .vscode/

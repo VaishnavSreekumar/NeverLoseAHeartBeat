@@ -19,6 +19,7 @@ Pursuant to Section 5 of the MayaCardio assessment brief:
 5. **[5-Minute Video Demonstration Script](docs/DEMO_GUIDE.md):** Timed storyboard, exact commands, and screen actions demonstrating network cut, process kill, and power-cut recovery.
 6. **[AI Tools & Methodology Disclosure](docs/AI_DISCLOSURE.md):** Formal disclosure of AI tools utilized and engineering quality controls enforced.
 7. **[ARM64 Linux Validation Report](docs/ARM64_VALIDATION.md):** Empirical validation running in an emulated ARM64 Linux container (4 CPU cores, 2 GB RAM bounds), 118 container tests, live streaming telemetry, and zero-backlog cloud reconciliation.
+8. **[Render & PostgreSQL Deployment Guide](docs/RENDER_DEPLOYMENT.md):** Production-ready deployment instructions for Render Web Services backed by durable PostgreSQL, addressing ephemeral filesystems and free-tier retention constraints.
 
 ---
 
@@ -27,8 +28,9 @@ Pursuant to Section 5 of the MayaCardio assessment brief:
 ```
 biosignal-assessment/
 ├── README.md                           # Project overview, deliverables index, and quickstart
+├── Dockerfile                          # Root multi-stage Docker build for cloud receiver on Render
 ├── pyproject.toml                      # Package metadata, CLI console script, and dependencies
-├── .gitignore                          # Git ignore rules for Python, SQLite, and scratch files
+├── .gitignore                          # Git ignore rules for Python, SQLite, environment, and scratch files
 │
 ├── biosignal_mock/                     # Independent sensor mock service (TCP socket daemon)
 │   ├── server.py                       # TCP server, NDJSON framing, connection handling
@@ -81,7 +83,8 @@ biosignal-assessment/
     ├── RESOURCE_MEASUREMENTS.md        # 1-hour resource profiling and ARM64 compliance audit
     ├── DEMO_GUIDE.md                   # 5-minute video demonstration script
     ├── AI_DISCLOSURE.md                # AI tools & methodology disclosure
-    └── ARM64_VALIDATION.md             # ARM64 Linux container empirical validation report
+    ├── ARM64_VALIDATION.md             # ARM64 Linux container empirical validation report
+    └── RENDER_DEPLOYMENT.md            # Render deployment and durable PostgreSQL configuration
 ```
 
 ---

@@ -55,8 +55,11 @@ The system consists of three decoupled operational tiers:
 
 ### Terminal 1: Start the Cloud Receiver (Optional / Cloud Mode)
 ```bash
-# Runs on localhost or remote server on port 8000
+# Local development mode (SQLite fallback on port 8000)
 python -m uvicorn pipeline.cloud.server:app --host 0.0.0.0 --port 8000
+
+# For production deployment on Render with durable PostgreSQL, see:
+# docs/RENDER_DEPLOYMENT.md
 ```
 
 ### Terminal 2: Start the Mock Sensor Daemon

@@ -16,7 +16,8 @@ import os
 from pathlib import Path
 from typing import Any, Optional
 
-from fastapi import Depends, FastAPI, Header, HTTPException, Query, Response, status
+import secrets
+from fastapi import Depends, FastAPI, Header, HTTPException, Query, Request, Response, status
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 from pipeline.cloud.service import CloudProcessingService
@@ -120,6 +121,7 @@ class BatchResponse(BaseModel):
 # ==============================================================================
 
 def verify_api_key(
+    request: Request,
     x_api_key: Optional[str] = Header(None, alias="X-API-Key"),
     authorization: Optional[str] = Header(None, alias="Authorization"),
 ) -> None:
@@ -128,7 +130,11 @@ def verify_api_key(
     If CLOUD_API_KEY environment variable is configured, requests must provide a
     matching key via 'X-API-Key' header or 'Authorization: Bearer <key>'.
     If CLOUD_API_KEY is unset or empty, authentication is disabled (local/test mode).
+    Public platform health probes (/healthz, /) are exempt to support Render health checks.
     """
+    if request.url.path in ("/healthz", "/"):
+        return
+
     expected = os.environ.get("CLOUD_API_KEY")
     if not expected:
         return
@@ -139,7 +145,7 @@ def verify_api_key(
         if len(parts) == 2 and parts[0].lower() == "bearer":
             provided = parts[1]
 
-    if not provided or provided != expected:
+    if not provided or not secrets.compare_digest(provided, expected):
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="Unauthorized: Invalid or missing API key",
@@ -150,6 +156,7 @@ def verify_api_key(
 def create_cloud_app(
     db_path: str | Path = "biosignal_cloud.db",
     storage: Optional[CloudStorageEngine] = None,
+    database_url: Optional[str] = None,
 ) -> FastAPI:
     """Factory function creating configured FastAPI cloud receiver application."""
     app = FastAPI(
@@ -160,12 +167,21 @@ def create_cloud_app(
     )
 
     if storage is None:
-        storage = CloudStorageEngine(db_path=db_path)
+        db_url = database_url or os.environ.get("DATABASE_URL") or os.environ.get("CLOUD_DATABASE_URL")
+        storage = CloudStorageEngine(db_path=db_path, database_url=db_url)
     processing_service = CloudProcessingService(storage=storage)
 
     # Attach to app state for lifecycle/testing access
     app.state.storage = storage
     app.state.service = processing_service
+
+    @app.get("/healthz", status_code=status.HTTP_200_OK, summary="Liveness probe for cloud platform")
+    def healthz() -> dict[str, str]:
+        return {"status": "healthy"}
+
+    @app.get("/", status_code=status.HTTP_200_OK, summary="Root health probe")
+    def root() -> dict[str, str]:
+        return {"status": "healthy", "service": "MayaCardio Cloud Ingestion Receiver"}
 
     @app.post(
         "/api/v1/ingest/batch",
@@ -309,11 +325,15 @@ def create_cloud_app(
 
 
 # Default ASGI application instance configured via environment variable
-app = create_cloud_app(db_path=os.environ.get("CLOUD_DB_PATH", "biosignal_cloud.db"))
+_default_db_url = os.environ.get("DATABASE_URL") or os.environ.get("CLOUD_DATABASE_URL")
+app = create_cloud_app(
+    db_path=os.environ.get("CLOUD_DB_PATH", "biosignal_cloud.db"),
+    database_url=_default_db_url,
+)
 
 
 if __name__ == "__main__":
     import uvicorn
-    host = os.environ.get("HOST", "127.0.0.1")
+    host = os.environ.get("HOST", "0.0.0.0")
     port = int(os.environ.get("PORT", "8000"))
     uvicorn.run("pipeline.cloud.server:app", host=host, port=port, reload=False)

@@ -1,7 +1,9 @@
-"""MayaCardio Cloud Durable Storage Engine (Phase 4A).
+"""MayaCardio Cloud Durable Storage Engine (Phase 4A & Render/PostgreSQL Extension).
 
 Responsible for:
-- SQLite Write-Ahead Logging (WAL) mode with explicit synchronous durability configuration.
+- Hybrid storage engine supporting both:
+  * Local/Embedded SQLite with Write-Ahead Logging (WAL) and synchronous durability modes.
+  * Remote/Cloud PostgreSQL (e.g. Render, Supabase, Neon) configured via DATABASE_URL.
 - Composite primary key (session_id, sensor, sample_index) preventing silent overwrite.
 - Explicit duplicate validation:
   * Identical duplicates are safely ignored (idempotent network retries).
@@ -13,22 +15,12 @@ Responsible for:
 - Adjacent loss record merging for identical reasons and streams.
 - Explicit dual contiguous cursor tracking:
   * contiguous_persisted_index (P): highest index such that every index 0..P exists
-    as a physically stored sample in SQLite (strictly samples, never loss).
+    as a physically stored sample (strictly samples, never loss).
   * contiguous_resolved_index (R): highest index such that every index 0..R is accounted
     for as either a stored sample or an authoritative bounded loss record (never across gaps).
   * highest_observed_index (O): highest sample or loss index observed across all batches.
-- Cursor relationship and out-of-order semantics:
-  * When a stream begins with physical samples and has no loss: P == R.
-  * When authoritative loss exists before or between samples (e.g. loss at [0, 49] and
-    samples at [50, 99]), P stops at the first missing sample (P = -1), while R advances
-    across the bounded loss to 99. Here P < R.
-  * Out-of-order batches (e.g. [100, 199] arriving before [0, 99]) are durably persisted
-    in the samples table, but neither P nor R advances past the gap (-1 <= P, R <= gap_start - 1).
-    Data is NEVER acknowledged as resolved merely because a later batch was stored.
-  * Open-ended loss records (to_index IS NULL) represent terminal uncertainty and halt
-    forward advancement of R at from_index - 1.
 - Crash-consistent restart recovery via authoritative checkpoint reconstruction.
-- Atomic batch transactions (BEGIN IMMEDIATE ... COMMIT / ROLLBACK).
+- Atomic batch transactions (ACID all-or-nothing guarantee).
 """
 
 from __future__ import annotations
@@ -36,12 +28,19 @@ from __future__ import annotations
 import json
 import logging
 import os
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from pathlib import Path
 import sqlite3
 import threading
 import time
 from typing import Any, Optional, Sequence
+
+try:
+    import psycopg2
+    import psycopg2.extras
+    HAS_PSYCOPG2 = True
+except ImportError:
+    HAS_PSYCOPG2 = False
 
 from pipeline.processing import LossRange, WindowResult
 from pipeline.protocol_client import IngestBatch
@@ -92,140 +91,308 @@ class CloudStorageTelemetry:
 
 
 class CloudStorageEngine:
-    """Durable SQLite storage engine for the cloud receiver."""
+    """Durable storage engine for the cloud receiver (supports SQLite and PostgreSQL)."""
 
     def __init__(
         self,
         db_path: str | Path = "biosignal_cloud.db",
         synchronous: Optional[str] = None,
         busy_timeout_ms: int = 5000,
+        database_url: Optional[str] = None,
     ) -> None:
         """Initialize the cloud storage engine.
 
-        Durability Tradeoffs:
-        - PRAGMA synchronous = NORMAL (default):
-          Provides 100% durability against application or container process crashes
-          (SIGKILL, fatal exceptions, sudden process exit). The SQLite WAL ensures the
-          database file is never corrupted and all committed transactions survive.
-          Does not issue an fsync on every transaction commit, relying on OS dirty-page
-          writeback.
-        - PRAGMA synchronous = FULL:
-          Issues an fsync on every transaction commit. Guarantees durability against physical
-          host power loss (assuming non-volatile hardware write caches). Tradeoff is
-          higher I/O latency per micro-batch.
-
-        Args:
-            db_path: Path to SQLite database file or ':memory:'.
-            synchronous: SQLite PRAGMA synchronous mode ('NORMAL' or 'FULL').
-                Defaults to CLOUD_SQLITE_SYNCHRONOUS env var, or 'NORMAL'.
-            busy_timeout_ms: Timeout in milliseconds waiting on database locks.
+        If database_url (or DATABASE_URL / CLOUD_DATABASE_URL environment variable)
+        starts with 'postgres://' or 'postgresql://', connects to PostgreSQL.
+        Otherwise, falls back to local SQLite with WAL mode.
         """
-        self.db_path = str(db_path)
-        if synchronous is None:
-            synchronous = os.getenv("CLOUD_SQLITE_SYNCHRONOUS", "NORMAL")
-        self.synchronous = synchronous.upper()
-        self.busy_timeout_ms = busy_timeout_ms
+        if database_url is None:
+            database_url = os.getenv("DATABASE_URL") or os.getenv("CLOUD_DATABASE_URL")
+
         self.telemetry = CloudStorageTelemetry()
         self._lock = threading.RLock()
+        self.busy_timeout_ms = busy_timeout_ms
 
-        self._conn: sqlite3.Connection = sqlite3.connect(
-            self.db_path,
-            timeout=busy_timeout_ms / 1000.0,
-            check_same_thread=False,
-            isolation_level=None,  # Autocommit mode; explicit BEGIN IMMEDIATE blocks
-        )
-        self._conn.row_factory = sqlite3.Row
+        if database_url and (
+            database_url.startswith("postgres://") or database_url.startswith("postgresql://")
+        ):
+            if not HAS_PSYCOPG2:
+                raise CloudStorageError(
+                    "PostgreSQL driver 'psycopg2' is not installed. Install with 'pip install psycopg2-binary'."
+                )
+            if database_url.startswith("postgres://"):
+                database_url = "postgresql://" + database_url[len("postgres://"):]
+            self.database_url = database_url
+            self.is_postgres = True
+            self.db_path = database_url
+            self.synchronous = "N/A"
+            try:
+                self._conn = psycopg2.connect(
+                    self.database_url,
+                    cursor_factory=psycopg2.extras.DictCursor,
+                )
+                self._conn.autocommit = False
+            except Exception as exc:
+                raise CloudStorageError(f"Failed to connect to PostgreSQL database: {exc}") from exc
+        else:
+            self.is_postgres = False
+            self.database_url = None
+            self.db_path = str(db_path)
+            if synchronous is None:
+                synchronous = os.getenv("CLOUD_SQLITE_SYNCHRONOUS", "NORMAL")
+            self.synchronous = synchronous.upper()
+            try:
+                self._conn = sqlite3.connect(
+                    self.db_path,
+                    timeout=busy_timeout_ms / 1000.0,
+                    check_same_thread=False,
+                    isolation_level=None,  # Autocommit mode; manual BEGIN IMMEDIATE
+                )
+                self._conn.row_factory = sqlite3.Row
+            except Exception as exc:
+                raise CloudStorageError(
+                    f"Failed to connect to SQLite database at '{self.db_path}': {exc}"
+                ) from exc
 
         self._init_pragmas_and_schema()
+
+    def _ensure_connected(self) -> None:
+        """Ensure connection is alive, reconnecting if dropped by server idle timeout."""
+        if not self.is_postgres:
+            return
+        needs_reconnect = False
+        if self._conn is None or getattr(self._conn, "closed", 0) != 0:
+            needs_reconnect = True
+        else:
+            try:
+                # Test connection liveness via cheap ping
+                cur = self._conn.cursor()
+                cur.execute("SELECT 1;")
+                cur.fetchone()
+                cur.close()
+            except Exception:
+                needs_reconnect = True
+                try:
+                    if self._conn:
+                        self._conn.close()
+                except Exception:
+                    pass
+
+        if needs_reconnect:
+            self._conn = psycopg2.connect(
+                self.database_url,
+                cursor_factory=psycopg2.extras.DictCursor,
+            )
+            self._conn.autocommit = False
+
+    def _get_cursor(self) -> Any:
+        """Get an active cursor, auto-reconnecting if PostgreSQL connection dropped."""
+        if self.is_postgres:
+            self._ensure_connected()
+        return self._conn.cursor()
+
+    def _execute(self, cursor: Any, query: str, params: Sequence[Any] = ()) -> Any:
+        """Execute a query with parameter placeholder translation if needed."""
+        if self.is_postgres:
+            pg_query = query.replace("?", "%s")
+            return cursor.execute(pg_query, params)
+        return cursor.execute(query, params)
+
+    def _executemany(self, cursor: Any, query: str, params_seq: Sequence[Sequence[Any]]) -> Any:
+        """Executemany with parameter placeholder translation if needed."""
+        if self.is_postgres:
+            pg_query = query.replace("?", "%s")
+            return cursor.executemany(pg_query, params_seq)
+        return cursor.executemany(query, params_seq)
+
+    def _begin(self, cursor: Any) -> None:
+        """Begin an immediate transaction."""
+        if not self.is_postgres:
+            cursor.execute("BEGIN IMMEDIATE;")
+
+    def _commit(self) -> None:
+        """Commit the current transaction."""
+        if self.is_postgres:
+            self._conn.commit()
+        else:
+            self._conn.execute("COMMIT;")
+
+    def _rollback(self) -> None:
+        """Rollback the current transaction."""
+        if self.is_postgres:
+            self._conn.rollback()
+        else:
+            try:
+                self._conn.execute("ROLLBACK;")
+            except Exception:
+                pass
 
     def _init_pragmas_and_schema(self) -> None:
         """Configure performance/durability pragmas and create required tables."""
         with self._lock:
             cursor = self._conn.cursor()
             try:
-                # Configure Write-Ahead Logging (WAL)
-                cursor.execute("PRAGMA journal_mode = WAL;")
-                cursor.execute(f"PRAGMA synchronous = {self.synchronous};")
-                cursor.execute("PRAGMA foreign_keys = ON;")
-                cursor.execute(f"PRAGMA busy_timeout = {self.busy_timeout_ms};")
+                if self.is_postgres:
+                    # Transaction-level advisory lock serializes DDL across concurrent workers/instances
+                    cursor.execute("SELECT pg_advisory_xact_lock(7142857);")
+                    cursor.execute("""
+                        CREATE TABLE IF NOT EXISTS sessions (
+                            session_id TEXT PRIMARY KEY,
+                            started_at DOUBLE PRECISION NOT NULL,
+                            ended_at DOUBLE PRECISION,
+                            clean_shutdown BOOLEAN DEFAULT FALSE
+                        );
+                    """)
+                    cursor.execute("""
+                        CREATE TABLE IF NOT EXISTS samples (
+                            session_id TEXT NOT NULL,
+                            sensor INTEGER NOT NULL CHECK (sensor IN (1, 2)),
+                            sample_index INTEGER NOT NULL CHECK (sample_index >= 0),
+                            ch1 INTEGER NOT NULL,
+                            ch2 INTEGER NOT NULL,
+                            ch3 INTEGER,
+                            created_at DOUBLE PRECISION NOT NULL,
+                            PRIMARY KEY (session_id, sensor, sample_index)
+                        );
+                    """)
+                    cursor.execute("""
+                        CREATE TABLE IF NOT EXISTS loss_ledger (
+                            id BIGSERIAL PRIMARY KEY,
+                            session_id TEXT NOT NULL,
+                            sensor INTEGER NOT NULL CHECK (sensor IN (1, 2)),
+                            from_index INTEGER NOT NULL CHECK (from_index >= 0),
+                            to_index INTEGER CHECK (to_index IS NULL OR to_index >= from_index),
+                            reason TEXT NOT NULL,
+                            detected_at DOUBLE PRECISION NOT NULL
+                        );
+                    """)
+                    cursor.execute("""
+                        CREATE UNIQUE INDEX IF NOT EXISTS uidx_loss_bounded
+                        ON loss_ledger (session_id, sensor, from_index, to_index, reason)
+                        WHERE to_index IS NOT NULL;
+                    """)
+                    cursor.execute("""
+                        CREATE UNIQUE INDEX IF NOT EXISTS uidx_loss_open
+                        ON loss_ledger (session_id, sensor, from_index, reason)
+                        WHERE to_index IS NULL;
+                    """)
+                    cursor.execute("""
+                        CREATE TABLE IF NOT EXISTS checkpoints (
+                            session_id TEXT NOT NULL,
+                            sensor INTEGER NOT NULL CHECK (sensor IN (1, 2)),
+                            contiguous_persisted_index INTEGER NOT NULL DEFAULT -1,
+                            contiguous_resolved_index INTEGER NOT NULL DEFAULT -1,
+                            highest_observed_index INTEGER NOT NULL DEFAULT -1,
+                            last_updated_at DOUBLE PRECISION NOT NULL,
+                            PRIMARY KEY (session_id, sensor)
+                        );
+                    """)
+                    cursor.execute("""
+                        CREATE TABLE IF NOT EXISTS window_results (
+                            session_id TEXT NOT NULL,
+                            "window" INTEGER NOT NULL,
+                            mode TEXT NOT NULL,
+                            complete BOOLEAN NOT NULL,
+                            missing_1 INTEGER NOT NULL,
+                            missing_2 INTEGER NOT NULL,
+                            magnitude DOUBLE PRECISION,
+                            heart_rate DOUBLE PRECISION,
+                            result_json TEXT NOT NULL,
+                            created_at DOUBLE PRECISION NOT NULL,
+                            PRIMARY KEY (session_id, "window")
+                        );
+                    """)
+                    cursor.execute("""
+                        CREATE INDEX IF NOT EXISTS idx_cloud_samples_cursor 
+                        ON samples (session_id, sensor, sample_index);
+                    """)
+                    cursor.execute("""
+                        CREATE INDEX IF NOT EXISTS idx_cloud_loss_cursor
+                        ON loss_ledger (session_id, sensor, from_index, to_index);
+                    """)
+                    cursor.execute("""
+                        CREATE INDEX IF NOT EXISTS idx_cloud_window_results
+                        ON window_results (session_id, "window");
+                    """)
+                    self._conn.commit()
+                else:
+                    # Configure Write-Ahead Logging (WAL) for SQLite
+                    cursor.execute("PRAGMA journal_mode = WAL;")
+                    cursor.execute(f"PRAGMA synchronous = {self.synchronous};")
+                    cursor.execute("PRAGMA foreign_keys = ON;")
+                    cursor.execute(f"PRAGMA busy_timeout = {self.busy_timeout_ms};")
 
-                # Create Tables
-                cursor.execute("""
-                    CREATE TABLE IF NOT EXISTS sessions (
-                        session_id TEXT PRIMARY KEY,
-                        started_at REAL NOT NULL,
-                        ended_at REAL,
-                        clean_shutdown BOOLEAN DEFAULT 0
-                    );
-                """)
-
-                cursor.execute("""
-                    CREATE TABLE IF NOT EXISTS samples (
-                        session_id TEXT NOT NULL,
-                        sensor INTEGER NOT NULL CHECK (sensor IN (1, 2)),
-                        sample_index INTEGER NOT NULL CHECK (sample_index >= 0),
-                        ch1 INTEGER NOT NULL,
-                        ch2 INTEGER NOT NULL,
-                        ch3 INTEGER,
-                        created_at REAL NOT NULL,
-                        PRIMARY KEY (session_id, sensor, sample_index)
-                    );
-                """)
-
-                cursor.execute("""
-                    CREATE TABLE IF NOT EXISTS loss_ledger (
-                        id INTEGER PRIMARY KEY AUTOINCREMENT,
-                        session_id TEXT NOT NULL,
-                        sensor INTEGER NOT NULL CHECK (sensor IN (1, 2)),
-                        from_index INTEGER NOT NULL CHECK (from_index >= 0),
-                        to_index INTEGER CHECK (to_index IS NULL OR to_index >= from_index),
-                        reason TEXT NOT NULL,
-                        detected_at REAL NOT NULL,
-                        UNIQUE (session_id, sensor, from_index, to_index, reason)
-                    );
-                """)
-
-                cursor.execute("""
-                    CREATE TABLE IF NOT EXISTS checkpoints (
-                        session_id TEXT NOT NULL,
-                        sensor INTEGER NOT NULL CHECK (sensor IN (1, 2)),
-                        contiguous_persisted_index INTEGER NOT NULL DEFAULT -1,
-                        contiguous_resolved_index INTEGER NOT NULL DEFAULT -1,
-                        highest_observed_index INTEGER NOT NULL DEFAULT -1,
-                        last_updated_at REAL NOT NULL,
-                        PRIMARY KEY (session_id, sensor)
-                    );
-                """)
-
-                cursor.execute("""
-                    CREATE TABLE IF NOT EXISTS window_results (
-                        session_id TEXT NOT NULL,
-                        window INTEGER NOT NULL,
-                        mode TEXT NOT NULL,
-                        complete BOOLEAN NOT NULL,
-                        missing_1 INTEGER NOT NULL,
-                        missing_2 INTEGER NOT NULL,
-                        magnitude REAL,
-                        heart_rate REAL,
-                        result_json TEXT NOT NULL,
-                        created_at REAL NOT NULL,
-                        PRIMARY KEY (session_id, window)
-                    );
-                """)
-
-                # High-throughput query indexes
-                cursor.execute("""
-                    CREATE INDEX IF NOT EXISTS idx_cloud_samples_cursor 
-                    ON samples (session_id, sensor, sample_index);
-                """)
-                cursor.execute("""
-                    CREATE INDEX IF NOT EXISTS idx_cloud_loss_cursor
-                    ON loss_ledger (session_id, sensor, from_index, to_index);
-                """)
-                cursor.execute("""
-                    CREATE INDEX IF NOT EXISTS idx_cloud_window_results
-                    ON window_results (session_id, window);
-                """)
+                    # Create Tables
+                    cursor.execute("""
+                        CREATE TABLE IF NOT EXISTS sessions (
+                            session_id TEXT PRIMARY KEY,
+                            started_at REAL NOT NULL,
+                            ended_at REAL,
+                            clean_shutdown BOOLEAN DEFAULT 0
+                        );
+                    """)
+                    cursor.execute("""
+                        CREATE TABLE IF NOT EXISTS samples (
+                            session_id TEXT NOT NULL,
+                            sensor INTEGER NOT NULL CHECK (sensor IN (1, 2)),
+                            sample_index INTEGER NOT NULL CHECK (sample_index >= 0),
+                            ch1 INTEGER NOT NULL,
+                            ch2 INTEGER NOT NULL,
+                            ch3 INTEGER,
+                            created_at REAL NOT NULL,
+                            PRIMARY KEY (session_id, sensor, sample_index)
+                        );
+                    """)
+                    cursor.execute("""
+                        CREATE TABLE IF NOT EXISTS loss_ledger (
+                            id INTEGER PRIMARY KEY AUTOINCREMENT,
+                            session_id TEXT NOT NULL,
+                            sensor INTEGER NOT NULL CHECK (sensor IN (1, 2)),
+                            from_index INTEGER NOT NULL CHECK (from_index >= 0),
+                            to_index INTEGER CHECK (to_index IS NULL OR to_index >= from_index),
+                            reason TEXT NOT NULL,
+                            detected_at REAL NOT NULL,
+                            UNIQUE (session_id, sensor, from_index, to_index, reason)
+                        );
+                    """)
+                    cursor.execute("""
+                        CREATE TABLE IF NOT EXISTS checkpoints (
+                            session_id TEXT NOT NULL,
+                            sensor INTEGER NOT NULL CHECK (sensor IN (1, 2)),
+                            contiguous_persisted_index INTEGER NOT NULL DEFAULT -1,
+                            contiguous_resolved_index INTEGER NOT NULL DEFAULT -1,
+                            highest_observed_index INTEGER NOT NULL DEFAULT -1,
+                            last_updated_at REAL NOT NULL,
+                            PRIMARY KEY (session_id, sensor)
+                        );
+                    """)
+                    cursor.execute("""
+                        CREATE TABLE IF NOT EXISTS window_results (
+                            session_id TEXT NOT NULL,
+                            window INTEGER NOT NULL,
+                            mode TEXT NOT NULL,
+                            complete BOOLEAN NOT NULL,
+                            missing_1 INTEGER NOT NULL,
+                            missing_2 INTEGER NOT NULL,
+                            magnitude REAL,
+                            heart_rate REAL,
+                            result_json TEXT NOT NULL,
+                            created_at REAL NOT NULL,
+                            PRIMARY KEY (session_id, window)
+                        );
+                    """)
+                    cursor.execute("""
+                        CREATE INDEX IF NOT EXISTS idx_cloud_samples_cursor 
+                        ON samples (session_id, sensor, sample_index);
+                    """)
+                    cursor.execute("""
+                        CREATE INDEX IF NOT EXISTS idx_cloud_loss_cursor
+                        ON loss_ledger (session_id, sensor, from_index, to_index);
+                    """)
+                    cursor.execute("""
+                        CREATE INDEX IF NOT EXISTS idx_cloud_window_results
+                        ON window_results (session_id, window);
+                    """)
             finally:
                 cursor.close()
 
@@ -233,7 +400,8 @@ class CloudStorageEngine:
         """Close the database connection safely."""
         with self._lock:
             try:
-                self._conn.close()
+                if self._conn is not None:
+                    self._conn.close()
             except Exception:
                 pass
 
@@ -249,16 +417,17 @@ class CloudStorageEngine:
         """
         with self._lock:
             now = time.time()
-            cursor = self._conn.cursor()
+            cursor = self._get_cursor()
             try:
-                cursor.execute("BEGIN IMMEDIATE;")
+                self._begin(cursor)
 
                 # 1. Register Session Record
-                cursor.execute(
+                self._execute(
+                    cursor,
                     """
                     INSERT INTO sessions (session_id, started_at)
                     VALUES (?, ?)
-                    ON CONFLICT(session_id) DO NOTHING;
+                    ON CONFLICT (session_id) DO NOTHING;
                     """,
                     (batch.session_id, now),
                 )
@@ -275,7 +444,8 @@ class CloudStorageEngine:
                     ch3 = values[2] if len(values) > 2 else None
 
                     # A. Check against contradictory loss records
-                    cursor.execute(
+                    self._execute(
+                        cursor,
                         """
                         SELECT from_index, to_index, reason FROM loss_ledger
                         WHERE session_id = ? AND sensor = ?
@@ -295,7 +465,8 @@ class CloudStorageEngine:
                         raise CloudContradictoryLossConflictError(msg)
 
                     # B. Check existing sample for duplicates or conflicts
-                    cursor.execute(
+                    self._execute(
+                        cursor,
                         """
                         SELECT ch1, ch2, ch3 FROM samples
                         WHERE session_id = ? AND sensor = ? AND sample_index = ?;
@@ -316,7 +487,8 @@ class CloudStorageEngine:
                             raise CloudIntegrityConflictError(msg)
                         batch_duplicates_ignored += 1
                     else:
-                        cursor.execute(
+                        self._execute(
+                            cursor,
                             """
                             INSERT INTO samples (session_id, sensor, sample_index, ch1, ch2, ch3, created_at)
                             VALUES (?, ?, ?, ?, ?, ?, ?);
@@ -329,7 +501,8 @@ class CloudStorageEngine:
                 for loss in batch.lost:
                     # A. Contradictory check: loss record must NOT cover existing persisted samples
                     if loss.to_index is not None:
-                        cursor.execute(
+                        self._execute(
+                            cursor,
                             """
                             SELECT COUNT(*) AS cnt FROM samples
                             WHERE session_id = ? AND sensor = ? 
@@ -338,7 +511,8 @@ class CloudStorageEngine:
                             (batch.session_id, batch.sensor, loss.from_index, loss.to_index),
                         )
                     else:
-                        cursor.execute(
+                        self._execute(
+                            cursor,
                             """
                             SELECT COUNT(*) AS cnt FROM samples
                             WHERE session_id = ? AND sensor = ? AND sample_index >= ?;
@@ -357,7 +531,8 @@ class CloudStorageEngine:
 
                     # B. Check for conflicting loss reason on overlapping range
                     effective_to = loss.to_index if loss.to_index is not None else 999999999
-                    cursor.execute(
+                    self._execute(
+                        cursor,
                         """
                         SELECT id, from_index, to_index, reason FROM loss_ledger
                         WHERE session_id = ? AND sensor = ?
@@ -379,8 +554,8 @@ class CloudStorageEngine:
                     # C. Open-ended loss closure and adjacent interval merging
                     merged = False
                     if loss.to_index is not None:
-                        # Check for exact open-ended loss record for same session, sensor, from_index, and reason
-                        cursor.execute(
+                        self._execute(
+                            cursor,
                             """
                             SELECT id FROM loss_ledger
                             WHERE session_id = ? AND sensor = ? AND reason = ? AND from_index = ? AND to_index IS NULL;
@@ -389,16 +564,17 @@ class CloudStorageEngine:
                         )
                         open_match = cursor.fetchone()
                         if open_match:
-                            # Authoritative bounded record closes this exact open-ended record
                             closed_id = open_match["id"]
-                            cursor.execute(
+                            self._execute(
+                                cursor,
                                 "UPDATE loss_ledger SET to_index = ? WHERE id = ?;",
                                 (loss.to_index, closed_id),
                             )
                             merged = True
 
                             # Check if closed record merges with right-adjacent record:
-                            cursor.execute(
+                            self._execute(
+                                cursor,
                                 """
                                 SELECT id, from_index, to_index FROM loss_ledger
                                 WHERE session_id = ? AND sensor = ? AND reason = ? AND from_index = ?;
@@ -407,14 +583,16 @@ class CloudStorageEngine:
                             )
                             right_adj = cursor.fetchone()
                             if right_adj:
-                                cursor.execute(
+                                self._execute(
+                                    cursor,
                                     "UPDATE loss_ledger SET to_index = ? WHERE id = ?;",
                                     (right_adj["to_index"], closed_id),
                                 )
-                                cursor.execute("DELETE FROM loss_ledger WHERE id = ?;", (right_adj["id"],))
+                                self._execute(cursor, "DELETE FROM loss_ledger WHERE id = ?;", (right_adj["id"],))
 
                             # Check if closed record merges with left-adjacent record:
-                            cursor.execute(
+                            self._execute(
+                                cursor,
                                 """
                                 SELECT id, from_index, to_index FROM loss_ledger
                                 WHERE session_id = ? AND sensor = ? AND reason = ? AND to_index = ?;
@@ -423,14 +601,16 @@ class CloudStorageEngine:
                             )
                             left_adj = cursor.fetchone()
                             if left_adj:
-                                cursor.execute(
-                                    "UPDATE loss_ledger SET to_index = (SELECT to_index FROM loss_ledger WHERE id = ?) WHERE id = ?;",
-                                    (closed_id, left_adj["id"]),
+                                self._execute(
+                                    cursor,
+                                    "UPDATE loss_ledger SET to_index = ? WHERE id = ?;",
+                                    (loss.to_index, left_adj["id"]),
                                 )
-                                cursor.execute("DELETE FROM loss_ledger WHERE id = ?;", (closed_id,))
+                                self._execute(cursor, "DELETE FROM loss_ledger WHERE id = ?;", (closed_id,))
                         else:
                             # Standard adjacent loss merging
-                            cursor.execute(
+                            self._execute(
+                                cursor,
                                 """
                                 SELECT id, from_index, to_index FROM loss_ledger
                                 WHERE session_id = ? AND sensor = ? AND reason = ? AND to_index = ?;
@@ -439,7 +619,8 @@ class CloudStorageEngine:
                             )
                             left_adj = cursor.fetchone()
 
-                            cursor.execute(
+                            self._execute(
+                                cursor,
                                 """
                                 SELECT id, from_index, to_index FROM loss_ledger
                                 WHERE session_id = ? AND sensor = ? AND reason = ? AND from_index = ?;
@@ -449,30 +630,37 @@ class CloudStorageEngine:
                             right_adj = cursor.fetchone()
 
                             if left_adj and right_adj:
-                                cursor.execute(
+                                self._execute(
+                                    cursor,
                                     "UPDATE loss_ledger SET to_index = ? WHERE id = ?;",
                                     (right_adj["to_index"], left_adj["id"]),
                                 )
-                                cursor.execute("DELETE FROM loss_ledger WHERE id = ?;", (right_adj["id"],))
+                                self._execute(cursor, "DELETE FROM loss_ledger WHERE id = ?;", (right_adj["id"],))
                                 merged = True
                             elif left_adj:
-                                cursor.execute(
-                                    "UPDATE loss_ledger SET to_index = MAX(to_index, ?) WHERE id = ?;",
-                                    (loss.to_index, left_adj["id"]),
+                                new_to = max(left_adj["to_index"] or 0, loss.to_index or 0)
+                                self._execute(
+                                    cursor,
+                                    "UPDATE loss_ledger SET to_index = ? WHERE id = ?;",
+                                    (new_to, left_adj["id"]),
                                 )
                                 merged = True
                             elif right_adj:
-                                cursor.execute(
-                                    "UPDATE loss_ledger SET from_index = MIN(from_index, ?) WHERE id = ?;",
-                                    (loss.from_index, right_adj["id"]),
+                                new_from = min(right_adj["from_index"], loss.from_index)
+                                self._execute(
+                                    cursor,
+                                    "UPDATE loss_ledger SET from_index = ? WHERE id = ?;",
+                                    (new_from, right_adj["id"]),
                                 )
                                 merged = True
 
                     if not merged:
-                        cursor.execute(
+                        self._execute(
+                            cursor,
                             """
-                            INSERT OR IGNORE INTO loss_ledger (session_id, sensor, from_index, to_index, reason, detected_at)
-                            VALUES (?, ?, ?, ?, ?, ?);
+                            INSERT INTO loss_ledger (session_id, sensor, from_index, to_index, reason, detected_at)
+                            VALUES (?, ?, ?, ?, ?, ?)
+                            ON CONFLICT DO NOTHING;
                             """,
                             (batch.session_id, batch.sensor, loss.from_index, loss.to_index, loss.reason, now),
                         )
@@ -480,16 +668,18 @@ class CloudStorageEngine:
 
                 # 4. Clean session end flag
                 if batch.session_end:
-                    cursor.execute(
+                    self._execute(
+                        cursor,
                         """
-                        UPDATE sessions SET ended_at = ?, clean_shutdown = 1
+                        UPDATE sessions SET ended_at = ?, clean_shutdown = ?
                         WHERE session_id = ?;
                         """,
-                        (now, batch.session_id),
+                        (now, True, batch.session_id),
                     )
 
                 # 5. Dual Contiguous Cursor Calculation
-                cursor.execute(
+                self._execute(
+                    cursor,
                     """
                     SELECT contiguous_persisted_index, contiguous_resolved_index, highest_observed_index
                     FROM checkpoints
@@ -519,9 +709,9 @@ class CloudStorageEngine:
                         new_obs = max(new_obs, loss.from_index)
 
                 # B. contiguous_persisted_index (P)
-                # Strictly physical samples contiguous from 0. NEVER advances across loss or gaps.
                 new_persisted = curr_persisted
-                cursor.execute(
+                self._execute(
+                    cursor,
                     """
                     SELECT sample_index FROM samples
                     WHERE session_id = ? AND sensor = ? AND sample_index > ?
@@ -537,15 +727,12 @@ class CloudStorageEngine:
                         break
 
                 # C. contiguous_resolved_index (R)
-                # Advances across stored samples OR authoritative bounded loss.
-                # Halts at unresolved gaps or open-ended loss.
-                # Optimization: samples 0..new_persisted are guaranteed physically present in SQLite.
-                # Therefore, resolution is guaranteed up to new_persisted.
                 new_resolved = max(curr_resolved, new_persisted)
                 while True:
                     candidate = new_resolved + 1
                     # Check physical sample
-                    cursor.execute(
+                    self._execute(
+                        cursor,
                         """
                         SELECT 1 FROM samples
                         WHERE session_id = ? AND sensor = ? AND sample_index = ?;
@@ -557,7 +744,8 @@ class CloudStorageEngine:
                         continue
 
                     # Check authoritative bounded loss
-                    cursor.execute(
+                    self._execute(
+                        cursor,
                         """
                         SELECT to_index FROM loss_ledger
                         WHERE session_id = ? AND sensor = ? 
@@ -573,7 +761,7 @@ class CloudStorageEngine:
                             new_resolved = to_idx
                             continue
                         else:
-                            # Open-ended loss (terminal uncertainty) halts resolution
+                            # Open-ended loss halts resolution
                             break
 
                     # Unresolved gap or unreceived sample
@@ -582,7 +770,8 @@ class CloudStorageEngine:
                 effective_obs = max(new_obs, new_resolved)
 
                 # 6. Update Checkpoints Table
-                cursor.execute(
+                self._execute(
+                    cursor,
                     """
                     INSERT INTO checkpoints (
                         session_id, sensor, contiguous_persisted_index,
@@ -598,7 +787,7 @@ class CloudStorageEngine:
                     (batch.session_id, batch.sensor, new_persisted, new_resolved, effective_obs, now),
                 )
 
-                cursor.execute("COMMIT;")
+                self._commit()
                 self.telemetry.batches_committed += 1
                 self.telemetry.samples_inserted += batch_samples_inserted
                 self.telemetry.duplicate_samples_ignored += batch_duplicates_ignored
@@ -613,10 +802,7 @@ class CloudStorageEngine:
                     last_updated_at=now,
                 )
             except Exception as exc:
-                try:
-                    cursor.execute("ROLLBACK;")
-                except Exception:
-                    pass
+                self._rollback()
                 self.telemetry.transactions_rolled_back += 1
                 logger.debug(f"Cloud transaction rolled back: {exc}")
                 raise
@@ -626,9 +812,10 @@ class CloudStorageEngine:
     def get_checkpoint(self, session_id: str, sensor: int) -> Optional[CloudCheckpointRecord]:
         """Fetch committed checkpoint for a stream."""
         with self._lock:
-            cursor = self._conn.cursor()
+            cursor = self._get_cursor()
             try:
-                cursor.execute(
+                self._execute(
+                    cursor,
                     """
                     SELECT contiguous_persisted_index, contiguous_resolved_index, 
                            highest_observed_index, last_updated_at
@@ -654,7 +841,7 @@ class CloudStorageEngine:
     def get_all_checkpoints(self, session_id: Optional[str] = None) -> list[CloudCheckpointRecord]:
         """Fetch all committed checkpoints, optionally filtered by session."""
         with self._lock:
-            cursor = self._conn.cursor()
+            cursor = self._get_cursor()
             try:
                 query = """
                     SELECT session_id, sensor, contiguous_persisted_index,
@@ -666,7 +853,7 @@ class CloudStorageEngine:
                     query += " WHERE session_id = ?"
                     params.append(session_id)
                 query += " ORDER BY session_id, sensor;"
-                cursor.execute(query, params)
+                self._execute(cursor, query, params)
                 return [
                     CloudCheckpointRecord(
                         session_id=r["session_id"],
@@ -689,7 +876,7 @@ class CloudStorageEngine:
         Used to recover exact state after a server crash/restart.
         """
         with self._lock:
-            cursor = self._conn.cursor()
+            cursor = self._get_cursor()
             try:
                 query = """
                     SELECT DISTINCT session_id, sensor FROM samples
@@ -698,11 +885,12 @@ class CloudStorageEngine:
                 """
                 params: list[Any] = []
                 if session_id:
-                    query = f"SELECT session_id, sensor FROM ({query}) WHERE session_id = ?"
+                    query = f"SELECT session_id, sensor FROM ({query}) AS sub WHERE session_id = ? ORDER BY session_id, sensor;"
                     params.append(session_id)
-                query += " ORDER BY session_id, sensor;"
+                else:
+                    query = f"SELECT session_id, sensor FROM ({query}) AS sub ORDER BY session_id, sensor;"
 
-                cursor.execute(query, params)
+                self._execute(cursor, query, params)
                 streams = cursor.fetchall()
                 reconstructed: dict[tuple[str, int], CloudCheckpointRecord] = {}
 
@@ -712,7 +900,8 @@ class CloudStorageEngine:
 
                     # 1. Contiguous persisted index (strictly stored samples from 0)
                     persisted = -1
-                    cursor.execute(
+                    self._execute(
+                        cursor,
                         """
                         SELECT sample_index FROM samples
                         WHERE session_id = ? AND sensor = ?
@@ -727,11 +916,11 @@ class CloudStorageEngine:
                             break
 
                     # 2. Contiguous resolved index (samples + authoritative loss)
-                    # Samples 0..persisted are guaranteed present, so resolved is at least persisted
                     resolved = max(-1, persisted)
                     while True:
                         cand = resolved + 1
-                        cursor.execute(
+                        self._execute(
+                            cursor,
                             "SELECT 1 FROM samples WHERE session_id = ? AND sensor = ? AND sample_index = ?;",
                             (s_id, sensor, cand),
                         )
@@ -739,7 +928,8 @@ class CloudStorageEngine:
                             resolved = cand
                             continue
 
-                        cursor.execute(
+                        self._execute(
+                            cursor,
                             """
                             SELECT to_index FROM loss_ledger
                             WHERE session_id = ? AND sensor = ? AND from_index <= ? 
@@ -755,12 +945,15 @@ class CloudStorageEngine:
                         break
 
                     # 3. Highest observed index
-                    cursor.execute(
+                    self._execute(
+                        cursor,
                         "SELECT MAX(sample_index) AS m_samp FROM samples WHERE session_id = ? AND sensor = ?;",
                         (s_id, sensor),
                     )
                     m_samp = cursor.fetchone()["m_samp"]
-                    cursor.execute(
+
+                    self._execute(
+                        cursor,
                         "SELECT MAX(to_index) AS m_loss_to, MAX(from_index) AS m_loss_from FROM loss_ledger WHERE session_id = ? AND sensor = ?;",
                         (s_id, sensor),
                     )
@@ -794,9 +987,10 @@ class CloudStorageEngine:
     ) -> tuple[dict[int, tuple[int, ...]], dict[int, tuple[int, ...]]]:
         """Fetch all samples for a session separated into sensor 1 and sensor 2 maps."""
         with self._lock:
-            cursor = self._conn.cursor()
+            cursor = self._get_cursor()
             try:
-                cursor.execute(
+                self._execute(
+                    cursor,
                     """
                     SELECT sensor, sample_index, ch1, ch2, ch3
                     FROM samples
@@ -821,9 +1015,10 @@ class CloudStorageEngine:
     def get_loss_records_for_session(self, session_id: str) -> list[LossRange]:
         """Fetch all loss records for a session as LossRange objects."""
         with self._lock:
-            cursor = self._conn.cursor()
+            cursor = self._get_cursor()
             try:
-                cursor.execute(
+                self._execute(
+                    cursor,
                     """
                     SELECT sensor, from_index, to_index, reason
                     FROM loss_ledger
@@ -847,9 +1042,10 @@ class CloudStorageEngine:
     def is_session_ended(self, session_id: str) -> bool:
         """Check if session has cleanly finished."""
         with self._lock:
-            cursor = self._conn.cursor()
+            cursor = self._get_cursor()
             try:
-                cursor.execute(
+                self._execute(
+                    cursor,
                     "SELECT clean_shutdown FROM sessions WHERE session_id = ?;",
                     (session_id,),
                 )
@@ -861,9 +1057,10 @@ class CloudStorageEngine:
     def get_active_sessions(self) -> list[str]:
         """List distinct session IDs currently present in storage."""
         with self._lock:
-            cursor = self._conn.cursor()
+            cursor = self._get_cursor()
             try:
-                cursor.execute(
+                self._execute(
+                    cursor,
                     """
                     SELECT session_id FROM sessions
                     UNION
@@ -871,7 +1068,7 @@ class CloudStorageEngine:
                     UNION
                     SELECT DISTINCT session_id FROM loss_ledger
                     ORDER BY session_id;
-                    """
+                    """,
                 )
                 return [r["session_id"] for r in cursor.fetchall()]
             finally:
@@ -880,9 +1077,10 @@ class CloudStorageEngine:
     def session_exists(self, session_id: str) -> bool:
         """Check whether a session exists in sessions, samples, or loss_ledger."""
         with self._lock:
-            cursor = self._conn.cursor()
+            cursor = self._get_cursor()
             try:
-                cursor.execute(
+                self._execute(
+                    cursor,
                     """
                     SELECT 1 FROM sessions WHERE session_id = ?
                     UNION
@@ -900,17 +1098,17 @@ class CloudStorageEngine:
     def get_counts(self, session_id: Optional[str] = None) -> tuple[int, int]:
         """Return total (samples_count, loss_records_count), optionally filtered by session_id."""
         with self._lock:
-            cursor = self._conn.cursor()
+            cursor = self._get_cursor()
             try:
                 if session_id:
-                    cursor.execute("SELECT COUNT(*) AS c FROM samples WHERE session_id = ?;", (session_id,))
+                    self._execute(cursor, "SELECT COUNT(*) AS c FROM samples WHERE session_id = ?;", (session_id,))
                     samp_cnt = cursor.fetchone()["c"]
-                    cursor.execute("SELECT COUNT(*) AS c FROM loss_ledger WHERE session_id = ?;", (session_id,))
+                    self._execute(cursor, "SELECT COUNT(*) AS c FROM loss_ledger WHERE session_id = ?;", (session_id,))
                     loss_cnt = cursor.fetchone()["c"]
                 else:
-                    cursor.execute("SELECT COUNT(*) AS c FROM samples;")
+                    self._execute(cursor, "SELECT COUNT(*) AS c FROM samples;")
                     samp_cnt = cursor.fetchone()["c"]
-                    cursor.execute("SELECT COUNT(*) AS c FROM loss_ledger;")
+                    self._execute(cursor, "SELECT COUNT(*) AS c FROM loss_ledger;")
                     loss_cnt = cursor.fetchone()["c"]
                 return samp_cnt, loss_cnt
             finally:
@@ -925,18 +1123,34 @@ class CloudStorageEngine:
         if not results:
             return
         with self._lock:
-            cursor = self._conn.cursor()
+            cursor = self._get_cursor()
             now = time.time()
             try:
-                cursor.execute("BEGIN IMMEDIATE;")
-                cursor.executemany(
+                self._begin(cursor)
+                params_list = [
+                    (
+                        res.session_id or "",
+                        res.window,
+                        res.mode,
+                        bool(res.complete),
+                        res.missing_1,
+                        res.missing_2,
+                        res.magnitude,
+                        res.heart_rate,
+                        json.dumps(res.to_dict()),
+                        now,
+                    )
+                    for res in results
+                ]
+                self._executemany(
+                    cursor,
                     """
                     INSERT INTO window_results (
-                        session_id, window, mode, complete, missing_1, missing_2,
+                        session_id, "window", mode, complete, missing_1, missing_2,
                         magnitude, heart_rate, result_json, created_at
                     )
                     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                    ON CONFLICT(session_id, window) DO UPDATE SET
+                    ON CONFLICT(session_id, "window") DO UPDATE SET
                         mode = excluded.mode,
                         complete = excluded.complete,
                         missing_1 = excluded.missing_1,
@@ -946,28 +1160,11 @@ class CloudStorageEngine:
                         result_json = excluded.result_json,
                         created_at = excluded.created_at;
                     """,
-                    [
-                        (
-                            res.session_id or "",
-                            res.window,
-                            res.mode,
-                            1 if res.complete else 0,
-                            res.missing_1,
-                            res.missing_2,
-                            res.magnitude,
-                            res.heart_rate,
-                            json.dumps(res.to_dict()),
-                            now,
-                        )
-                        for res in results
-                    ],
+                    params_list,
                 )
-                cursor.execute("COMMIT;")
+                self._commit()
             except Exception:
-                try:
-                    cursor.execute("ROLLBACK;")
-                except Exception:
-                    pass
+                self._rollback()
                 raise
             finally:
                 cursor.close()
@@ -975,13 +1172,14 @@ class CloudStorageEngine:
     def get_window_results(self, session_id: str) -> list[WindowResult]:
         """Fetch all computed window results for a session ordered by window."""
         with self._lock:
-            cursor = self._conn.cursor()
+            cursor = self._get_cursor()
             try:
-                cursor.execute(
+                self._execute(
+                    cursor,
                     """
                     SELECT result_json FROM window_results
                     WHERE session_id = ?
-                    ORDER BY window ASC;
+                    ORDER BY "window" ASC;
                     """,
                     (session_id,),
                 )
@@ -1011,10 +1209,11 @@ class CloudStorageEngine:
         """Generate official Section 4 NDJSON export records for a session."""
         records: list[dict[str, Any]] = []
         with self._lock:
-            cursor = self._conn.cursor()
+            cursor = self._get_cursor()
             try:
                 # 1. Samples ordered by sample_index ASC, sensor ASC
-                cursor.execute(
+                self._execute(
+                    cursor,
                     """
                     SELECT sensor, sample_index, ch1, ch2, ch3
                     FROM samples
@@ -1037,7 +1236,8 @@ class CloudStorageEngine:
                     })
 
                 # 2. Loss records ordered by from_index ASC, sensor ASC
-                cursor.execute(
+                self._execute(
+                    cursor,
                     """
                     SELECT sensor, from_index, to_index, reason
                     FROM loss_ledger

@@ -44,8 +44,14 @@ def get_active_cloud_api_key() -> str:
             key = p.environ().get("CLOUD_API_KEY")
             if key:
                 return key
-    # Fallback to known local key if process inspect fails
-    return "b250f3c7253a43b3903a62a4d6b0aa6bfb71759e7ff1424c8a2ecd0c2602acb3"
+    # Fallback to current process environment variables
+    key = os.environ.get("CLOUD_API_KEY") or os.environ.get("PIPELINE_API_KEY")
+    if key:
+        return key
+    raise RuntimeError(
+        "Active cloud API key could not be determined. "
+        "Please export CLOUD_API_KEY or PIPELINE_API_KEY in your environment."
+    )
 
 
 async def run_e2e_validation() -> dict:
